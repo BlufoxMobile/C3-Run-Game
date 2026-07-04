@@ -6,7 +6,7 @@
 <title>C³ FOX RUN</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; -webkit-user-select:none; user-select:none; }
-  html,body { height:100%; overflow:hidden; background:#0a0f1a; font-family:'Trebuchet MS','Segoe UI',sans-serif; }
+  html,body { height:100%; overflow:hidden; background:#0a0f1a; font-family:'Trebuchet MS','Segoe UI',sans-serif; touch-action:manipulation; }
   #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
   canvas { display:block; touch-action:none; }
   .overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
@@ -74,8 +74,8 @@
   .ctl:active, .ctl.on { background:rgba(255,176,31,.6); transform:scale(.93); box-shadow:0 2px 0 rgba(0,0,0,.3); }
   .arrow { width:86px; height:86px; border-radius:26px; font-size:42px; }
   #leftBtn { left:18px; } #rightBtn { right:18px; }
-  #jumpBtn { left:50%; transform:translateX(-50%); width:126px; height:72px; border-radius:40px; font-size:18px; font-weight:800; letter-spacing:2px; }
-  #jumpBtn:active { transform:translateX(-50%) scale(.93); }
+  .jump { bottom:124px; width:86px; height:70px; border-radius:30px; font-size:15px; font-weight:800; letter-spacing:1px; }
+  #jumpBtnL { left:18px; } #jumpBtnR { right:18px; }
 </style>
 </head>
 <body>
@@ -88,7 +88,8 @@
 <div id="tracker" class="hidden"></div>
 <div id="sound" class="hidden">♪</div>
 <div id="ctrls" class="hidden">
-  <div class="ctl arrow" id="leftBtn">◀</div><div class="ctl" id="jumpBtn">JUMP ⬆</div><div class="ctl arrow" id="rightBtn">▶</div>
+  <div class="ctl jump" id="jumpBtnL">JUMP ⬆</div><div class="ctl arrow" id="leftBtn">◀</div>
+  <div class="ctl jump" id="jumpBtnR">JUMP ⬆</div><div class="ctl arrow" id="rightBtn">▶</div>
 </div>
 
 <div id="start" class="overlay">
@@ -126,6 +127,16 @@
 
 <script>
 (()=>{
+  // ---- block double-tap / pinch zoom on mobile (iOS ignores user-scalable=no) ----
+  let lastTouchEnd=0;
+  document.addEventListener('touchend',e=>{
+    const now=Date.now();
+    if(now-lastTouchEnd<=350 && e.target.id!=='initials'){ e.preventDefault(); e.target.click&&e.target.click(); }
+    lastTouchEnd=now;
+  },{passive:false});
+  document.addEventListener('dblclick',e=>e.preventDefault(),{passive:false});
+  document.addEventListener('gesturestart',e=>e.preventDefault(),{passive:false});
+
   const cv=document.getElementById('c'), ctx=cv.getContext('2d');
   let W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
   function resize(){ W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR;cv.style.width=W+'px';cv.style.height=H+'px';ctx.setTransform(DPR,0,0,DPR,0,0); initStars(); }
@@ -218,7 +229,7 @@
   cv.addEventListener('pointermove',e=>{ if(state!==PLAY||swiped)return; const dx=e.clientX-psx,dy=e.clientY-psy; if(Math.abs(dx)>40&&Math.abs(dx)>Math.abs(dy)){ moveLane(dx>0?1:-1); swiped=true; } else if(dy<-40&&Math.abs(dy)>Math.abs(dx)){ jump(); swiped=true; } });
   cv.addEventListener('pointerup',e=>{ if(state!==PLAY||swiped)return; const dx=e.clientX-psx,dy=e.clientY-psy; if(Math.abs(dx)<20&&Math.abs(dy)<20) jump(); });
   function bindTap(id,fn){ const el=document.getElementById(id); el.addEventListener('pointerdown',e=>{e.preventDefault();fn();el.classList.add('on');}); const off=()=>el.classList.remove('on'); el.addEventListener('pointerup',off);el.addEventListener('pointerleave',off);el.addEventListener('pointercancel',off); }
-  bindTap('leftBtn',()=>moveLane(-1)); bindTap('rightBtn',()=>moveLane(1)); bindTap('jumpBtn',jump);
+  bindTap('leftBtn',()=>moveLane(-1)); bindTap('rightBtn',()=>moveLane(1)); bindTap('jumpBtnL',jump); bindTap('jumpBtnR',jump);
   function updTracker(){ document.getElementById('tracker').innerHTML=(shield>0?'<span class="sh">🛡×'+shield+'</span>&nbsp;&nbsp;':'')+'<span class="ts">📋 '+(tsheetTotal%5)+'/5 → $100</span>'; }
 
   function startGame(){
