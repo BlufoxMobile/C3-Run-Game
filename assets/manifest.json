@@ -19,94 +19,140 @@
     "png": 372840
    }
   },
-  "mon_chargeback": {
-   "src": "mon_chargeback.webp",
-   "w": 512,
-   "h": 410,
+  "bg_chicago": {
+   "src": "bg_chicago.webp",
+   "w": 1024,
+   "h": 371,
    "ax": 0.5,
-   "ay": 0.9978,
+   "ay": 1.0,
    "frames": 1,
    "fps": 0,
+   "unitsHigh": 6.0,
+   "anchor": "center",
+   "aspect": 2.7601,
+   "trimmedW": 2856,
+   "trimmedH": 1035,
+   "bytes": {
+    "webp": 70666,
+    "png": 404397
+   }
+  },
+  "bg_smokies": {
+   "src": "bg_smokies.webp",
+   "w": 1024,
+   "h": 192,
+   "ax": 0.5,
+   "ay": 1.0,
+   "frames": 1,
+   "fps": 0,
+   "unitsHigh": 6.0,
+   "anchor": "center",
+   "aspect": 5.3333,
+   "trimmedW": 2945,
+   "trimmedH": 551,
+   "bytes": {
+    "webp": 47710,
+    "png": 293670
+   }
+  },
+  "mon_chargeback": {
+   "src": "mon_chargeback.webp",
+   "w": 472,
+   "h": 512,
+   "ax": 0.5,
+   "ay": 0.9976,
+   "frames": 4,
+   "fps": 8,
    "unitsHigh": 2.4,
    "anchor": "feet",
-   "aspect": 1.2488,
-   "trimmedW": 1743,
-   "trimmedH": 1395,
+   "aspect": 0.9219,
+   "sheetW": 1888,
+   "sheetH": 512,
+   "trimmedW": 771,
+   "trimmedH": 836,
    "bytes": {
-    "webp": 68414,
-    "png": 388489
+    "webp": 249752,
+    "png": 1508486
    }
   },
   "mon_exception": {
    "src": "mon_exception.webp",
-   "w": 512,
-   "h": 479,
+   "w": 415,
+   "h": 512,
    "ax": 0.5,
-   "ay": 0.9982,
-   "frames": 1,
-   "fps": 0,
+   "ay": 0.9979,
+   "frames": 4,
+   "fps": 8,
    "unitsHigh": 2.4,
    "anchor": "feet",
-   "aspect": 1.0689,
-   "trimmedW": 1763,
-   "trimmedH": 1651,
+   "aspect": 0.8105,
+   "sheetW": 1660,
+   "sheetH": 512,
+   "trimmedW": 783,
+   "trimmedH": 965,
    "bytes": {
-    "webp": 78116,
-    "png": 460485
+    "webp": 220734,
+    "png": 1355304
    }
   },
   "mon_falloff": {
    "src": "mon_falloff.webp",
    "w": 512,
-   "h": 440,
+   "h": 315,
    "ax": 0.5,
-   "ay": 0.9947,
-   "frames": 1,
-   "fps": 0,
+   "ay": 0.9812,
+   "frames": 4,
+   "fps": 8,
    "unitsHigh": 2.4,
    "anchor": "feet",
-   "aspect": 1.1636,
-   "trimmedW": 1746,
-   "trimmedH": 1499,
+   "aspect": 1.6254,
+   "sheetW": 2048,
+   "sheetH": 315,
+   "trimmedW": 1123,
+   "trimmedH": 692,
    "bytes": {
-    "webp": 89142,
-    "png": 431867
+    "webp": 177352,
+    "png": 837959
    }
   },
   "mon_nonusage": {
    "src": "mon_nonusage.webp",
-   "w": 512,
-   "h": 510,
+   "w": 446,
+   "h": 512,
    "ax": 0.5,
-   "ay": 0.9994,
-   "frames": 1,
-   "fps": 0,
+   "ay": 0.9989,
+   "frames": 4,
+   "fps": 6,
    "unitsHigh": 2.4,
    "anchor": "feet",
-   "aspect": 1.0039,
-   "trimmedW": 1564,
-   "trimmedH": 1557,
+   "aspect": 0.8711,
+   "sheetW": 1784,
+   "sheetH": 512,
+   "trimmedW": 820,
+   "trimmedH": 941,
    "bytes": {
-    "webp": 64240,
-    "png": 477882
+    "webp": 172588,
+    "png": 1368592
    }
   },
   "mon_retail360": {
    "src": "mon_retail360.webp",
-   "w": 483,
+   "w": 502,
    "h": 512,
    "ax": 0.5,
-   "ay": 0.9987,
-   "frames": 1,
-   "fps": 0,
+   "ay": 0.9988,
+   "frames": 4,
+   "fps": 8,
    "unitsHigh": 2.4,
    "anchor": "feet",
-   "aspect": 0.9434,
-   "trimmedW": 1431,
-   "trimmedH": 1518,
+   "aspect": 0.9805,
+   "sheetW": 2008,
+   "sheetH": 512,
+   "trimmedW": 822,
+   "trimmedH": 838,
    "bytes": {
-    "webp": 67704,
-    "png": 427409
+    "webp": 248720,
+    "png": 1690086
    }
   },
   "orb_tab": {
@@ -183,20 +229,22 @@
   },
   "player_hit": {
    "src": "player_hit.webp",
-   "w": 459,
-   "h": 512,
-   "ax": 0.42,
-   "ay": 0.9988,
-   "frames": 1,
-   "fps": 0,
+   "w": 512,
+   "h": 349,
+   "ax": 0.45,
+   "ay": 0.9979,
+   "frames": 4,
+   "fps": 10,
    "unitsHigh": 2.4,
    "anchor": "feet",
-   "aspect": 0.8965,
-   "trimmedW": 1501,
-   "trimmedH": 1674,
+   "aspect": 1.467,
+   "sheetW": 2048,
+   "sheetH": 349,
+   "trimmedW": 1397,
+   "trimmedH": 951,
    "bytes": {
-    "webp": 61708,
-    "png": 396414
+    "webp": 122160,
+    "png": 652418
    }
   },
   "player_jump": {
@@ -237,6 +285,24 @@
     "png": 1228367
    }
   },
+  "scen_barn": {
+   "src": "scen_barn.webp",
+   "w": 512,
+   "h": 446,
+   "ax": 0.5296,
+   "ay": 0.9991,
+   "frames": 1,
+   "fps": 0,
+   "unitsHigh": 2.8,
+   "anchor": "feet",
+   "aspect": 1.148,
+   "trimmedW": 1251,
+   "trimmedH": 1090,
+   "bytes": {
+    "webp": 60098,
+    "png": 413337
+   }
+  },
   "scen_flag": {
    "src": "scen_flag.webp",
    "w": 157,
@@ -253,6 +319,42 @@
    "bytes": {
     "webp": 21640,
     "png": 118222
+   }
+  },
+  "scen_ltrain": {
+   "src": "scen_ltrain.webp",
+   "w": 512,
+   "h": 323,
+   "ax": 0.5935,
+   "ay": 0.9992,
+   "frames": 1,
+   "fps": 0,
+   "unitsHigh": 3.2,
+   "anchor": "feet",
+   "aspect": 1.5851,
+   "trimmedW": 1995,
+   "trimmedH": 1260,
+   "bytes": {
+    "webp": 43486,
+    "png": 241873
+   }
+  },
+  "scen_pine": {
+   "src": "scen_pine.webp",
+   "w": 244,
+   "h": 512,
+   "ax": 0.5009,
+   "ay": 0.9995,
+   "frames": 1,
+   "fps": 0,
+   "unitsHigh": 3.0,
+   "anchor": "feet",
+   "aspect": 0.4766,
+   "trimmedW": 1005,
+   "trimmedH": 2112,
+   "bytes": {
+    "webp": 40200,
+    "png": 183793
    }
   },
   "scen_sign": {
@@ -289,6 +391,42 @@
    "bytes": {
     "webp": 37798,
     "png": 279862
+   }
+  },
+  "scen_turbine": {
+   "src": "scen_turbine.webp",
+   "w": 224,
+   "h": 512,
+   "ax": 0.6282,
+   "ay": 0.9995,
+   "frames": 1,
+   "fps": 0,
+   "unitsHigh": 4.2,
+   "anchor": "feet",
+   "aspect": 0.4375,
+   "trimmedW": 870,
+   "trimmedH": 1987,
+   "bytes": {
+    "webp": 16336,
+    "png": 85651
+   }
+  },
+  "scen_walkup": {
+   "src": "scen_walkup.webp",
+   "w": 219,
+   "h": 512,
+   "ax": 0.495,
+   "ay": 0.9985,
+   "frames": 1,
+   "fps": 0,
+   "unitsHigh": 4.0,
+   "anchor": "feet",
+   "aspect": 0.4277,
+   "trimmedW": 832,
+   "trimmedH": 1942,
+   "bytes": {
+    "webp": 35594,
+    "png": 213420
    }
   }
  }

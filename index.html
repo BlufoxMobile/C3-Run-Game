@@ -347,7 +347,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       outrun the commission killers:<br>
       <span class="killer" style="background:#f59e0b">⚡ EXCEPTION</span><span class="killer" style="background:#ef4444">🫠 FALL-OFF</span><span class="killer" style="background:#e11d48">🪙 CHARGE BACK</span><span class="killer" style="background:#64748b">😴 NON-USAGE</span><span class="killer" style="background:#6366f1">🤖 RETAIL 360</span>
     </div>
-    <div class="worlds"><b>12 WORLDS · IT NEVER STOPS GETTING HARDER</b><br>
+    <div class="worlds"><b>EAST TENNESSEE → CHICAGO · 12 STOPS</b><br>
       ROOKIE → CLOSER → DISTRICT MGR → HALL OF FAME</div>
     <div class="hint"><b>SWIPE</b> or use the buttons &nbsp;·&nbsp; <b>TAP</b> to jump</div>
     <div id="a2hs" class="hidden">
@@ -412,29 +412,52 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 </div>
 
 <!-- =====================================================================
-     LEADERBOARD CLIENT ADAPTER — inlined verbatim from client-adapter.js
+     LEADERBOARD CLIENT ADAPTER — inlined verbatim from client-adapter-v2.js
+     Cloudflare Worker backend: real fetch GET/POST, no JSONP.
      ===================================================================== -->
 <script>
 /* ============================================================================
- *  C3 FOX RUN -- LEADERBOARD CLIENT ADAPTER
+ *  C3 FOX RUN -- LEADERBOARD CLIENT ADAPTER  v2  (Cloudflare Worker edition)
  *  Plain script. No build step, no imports, no dependencies.
- *  Drop it in with:   <script src="client-adapter.js"><\/script>
+ *  Drop it in with:   <script src="client-adapter-v2.js"><\/script>
  *  It defines exactly one global: window.LB
  * ============================================================================
  *
  *  THE PROMISE THIS MODULE MAKES
  *  -----------------------------
  *  The game NEVER breaks because of the leaderboard.
- *  No URL configured, Wi-Fi dead in the back of the store, Google having a
+ *  No URL configured, Wi-Fi dead in the back of the store, Cloudflare having a
  *  bad morning, an 8-second timeout -- in every one of those cases you get
  *  back the same shape of data, served from this phone's localStorage, and
  *  the rep still sees their score. The only difference is LB.isOnline().
  *
+ *  WHAT CHANGED FROM v1
+ *  --------------------
+ *  v1 talked to Google Apps Script, which will not answer a CORS preflight, so
+ *  every call -- including writes -- had to be smuggled out as a JSONP
+ *  <script> tag. That is gone. A Cloudflare Worker does real CORS, so this
+ *  version uses fetch() with a real GET for reads and a real POST with a JSON
+ *  body for writes, plus an AbortController timeout.
+ *
+ *  The PUBLIC INTERFACE IS IDENTICAL. configure / config / top / submit /
+ *  identity / setIdentity / clientId / isOnline / pendingCount / sync /
+ *  nameClash / clearLocal all behave exactly as before. This file is a
+ *  drop-in replacement: swap the <script> and change the URL in LB.configure.
+ *
+ *  Everything that made v1 survivable is still here:
+ *    - localStorage board that renders when the network is dead
+ *    - offline queueing, INCLUDING when no URL is configured yet
+ *    - retry drain on the next successful call, and on a late LB.configure()
+ *    - remote/local merge with dedup, where the server's spelling of a name
+ *      wins over whatever this phone happens to have typed
+ *    - a short read cache
+ *    - promises that never reject
+ *
  *  QUICK START
  *  -----------
  *    LB.configure({
- *      url: 'https://script.google.com/macros/s/AKfy..../exec',  // or null
- *      district: 'Big South'                                     // optional
+ *      url: 'https://c3-fox-run.YOURNAME.workers.dev',   // or null
+ *      district: 'Big South'                             // optional
  *    });
  *
  *    LB.setIdentity('JEFF', 'Big South');       // remembered in localStorage
@@ -447,13 +470,6 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
  *      .then(function (res) { ... });          // res.ok, res.remote, res.rank
  *
  *    if (!LB.isOnline()) showHint('OFFLINE -- scores saved on this device');
- *
- *  WHY JSONP AND NOT fetch()
- *  -------------------------
- *  Apps Script web apps redirect to script.googleusercontent.com and do not
- *  answer CORS preflights. fetch() from GitHub Pages fails on phones. A
- *  <script> tag has no CORS rules at all, so that is what we use -- for reads
- *  AND for writes. See the long comment in Code.gs.
  * ==========================================================================*/
 
 (function (global) {
@@ -463,15 +479,16 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
    * 1. CONSTANTS + CONFIG
    * ====================================================================== */
 
-  var VERSION       = '1.0.0';
-  var TIMEOUT_MS    = 8000;      // JSONP give-up time, per the spec
-  var MAX_NAME_LEN  = 24;        // must match Code.gs
+  var VERSION       = '2.0.0';
+  var TIMEOUT_MS    = 8000;      // AbortController give-up time
+  var MAX_NAME_LEN  = 24;        // must match worker.js
   var MAX_DIST_LEN  = 40;
-  var MAX_SCORE     = 5000000;   // must match Code.gs
+  var MAX_SCORE     = 5000000;   // must match worker.js
   var LOCAL_KEEP    = 100;       // rows kept in the on-device board
   var QUEUE_KEEP    = 50;        // failed submits held for retry
   var QUEUE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;  // 7 days
   var QUEUE_FLUSH   = 5;         // retries attempted per opportunity
+  var READ_CACHE_MS = 4000;      // in-memory reuse of a /top response
 
   var K_BOARD    = 'c3lb_board_v1';
   var K_IDENTITY = 'c3lb_identity_v1';
@@ -479,7 +496,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
   var K_QUEUE    = 'c3lb_queue_v1';
 
   var CFG = {
-    url:      '',   // Apps Script /exec URL. '' or null => pure offline mode.
+    url:      '',   // Worker base URL. '' or null => pure offline mode.
     district: ''    // default district used when identity has none
   };
 
@@ -488,7 +505,9 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
   // request has even finished).
   var lastRemoteOk = null;
 
-  var seq = 0;      // unique-ifies JSONP callback names
+  // Small read cache so the start screen and the game-over screen asking for
+  // the board a second apart do not both hit the network.
+  var readCache = { key: '', at: 0, rows: null };
 
 
   /* =========================================================================
@@ -540,7 +559,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 
   /**
    * Strips HTML, control characters and extra whitespace; truncates.
-   * Mirrors cleanText_() in Code.gs so the client and server agree on what a
+   * Mirrors cleanText() in worker.js so the client and server agree on what a
    * name is -- otherwise a name shows one way locally and another on the board.
    */
   function cleanText(value, maxLen) {
@@ -568,19 +587,22 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
   function cleanDistrict(value) { return cleanText(value, MAX_DIST_LEN); }
 
   /**
-   * Dedup key. Same rule as normalizeKey_() in Code.gs: lowercase, and ignore
-   * everything that is not a letter or digit, so "J. Smith" and "j smith" are
+   * Dedup key. Same rule as normalizeName() in worker.js: lowercase, and ignore
+   * everything that is not a letter or a digit, so "J. Smith" and "j smith" are
    * one person on the board instead of two.
+   *
+   * UNICODE MATTERS. The original rule stripped everything that was not
+   * [a-z0-9], so a name written in Cyrillic, Chinese or emoji normalized to the
+   * EMPTY STRING and every such player shared one row. \p{L}\p{N} with /u keeps
+   * letters and digits from any script; an emoji-only name falls back to the
+   * cleaned string so it still gets a key of its own.
    */
   function normKey(name) {
     var s = cleanName(name).toLowerCase();
     var k;
-    // The old rule stripped everything that was not [a-z0-9], so a name written
-    // in Cyrillic, Chinese or emoji normalized to the EMPTY STRING and every
-    // such player shared one row. Keep any unicode letter or digit.
     try { k = s.replace(/[^\p{L}\p{N}]+/gu, ''); }
     catch (e) { k = s.replace(/[^a-z0-9]+/g, ''); }
-    if (!k) k = s.replace(/\s+/g, '');   // emoji-only names keep their own key
+    if (!k) k = s.replace(/\s+/g, '');
     return k;
   }
 
@@ -674,7 +696,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
    * the UI can mark it if it wants to.
    *
    * Rules:
-   *   - dedup by normalized name
+   *   - dedup by name + district
    *   - on a collision the HIGHER score wins
    *   - on an exact tie the REMOTE row wins (it has the authoritative
    *     district and timestamp)
@@ -719,11 +741,11 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
         // The first spelling seen wins, and remote rows are inserted first, so
         // the board shows "Jeff" (as stored on the server) rather than flipping
         // to "jeff" just because this phone happens to hold the better run.
-        existing.score   = entry.score;
-        existing.level   = Math.max(entry.level, existing.level);
+        existing.score    = entry.score;
+        existing.level    = Math.max(entry.level, existing.level);
         existing.district = existing.district || entry.district;
-        existing.updated = entry.updated || existing.updated;
-        existing.pending = isPending;
+        existing.updated  = entry.updated || existing.updated;
+        existing.pending  = isPending;
       } else {
         existing.level    = Math.max(existing.level, entry.level);
         existing.district = existing.district || entry.district;
@@ -732,7 +754,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       }
     }
 
-    // Remote first, so remote wins exact ties.
+    // Remote first, so remote wins exact ties AND owns the display spelling.
     var r = remote || [];
     for (i = 0; i < r.length; i++) put(r[i], false);
 
@@ -760,6 +782,25 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
     return parts.join('&');
   }
 
+  /**
+   * Normalises whatever Jeff pasted into LB.configure into a base URL with no
+   * trailing slash, so endpoint() can just append '/top' or '/submit'.
+   * Tolerates a pasted '.../top' or '.../ping' by trimming a known endpoint
+   * off the end -- that is a very easy mistake to make from the address bar.
+   */
+  function baseUrl(raw) {
+    var u = String(raw || '').trim();
+    if (!u) return '';
+    u = u.replace(/[?#].*$/, '');            // drop any query/fragment
+    u = u.replace(/\/+$/, '');               // drop trailing slashes
+    u = u.replace(/\/(top|submit|ping|reset)$/i, '');   // pasted an endpoint
+    return u;
+  }
+
+  function endpoint(path) {
+    return baseUrl(CFG.url) + path;
+  }
+
 
   /* =========================================================================
    * 4. LOCAL BOARD  (the fallback that makes the game unbreakable)
@@ -773,7 +814,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 
   /**
    * Upserts one entry into the on-device board, keeping only the best score
-   * (and the best level) per name -- exactly like the server does.
+   * (and the best level) per player -- exactly like the server does.
    */
   function localUpsert(entry) {
     var rows = localRows();
@@ -878,6 +919,9 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
   /**
    * Fire-and-forget retry of parked submissions. Never rejects, never blocks
    * whatever called it.
+   *
+   * Only the leading run of successes is dropped from the queue, so a failure
+   * in the middle of a batch never silently discards the items behind it.
    */
   function queueFlush() {
     if (!CFG.url) return;
@@ -896,8 +940,11 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 
     for (var i = 0; i < batch.length; i++) {
       (function (item) {
-        jsonp(item.payload, TIMEOUT_MS).then(function (res) {
-          if (res && res.ok) okCount++;
+        postJson('/submit', item.payload, TIMEOUT_MS).then(function (res) {
+          // A server-side REJECTION (bad name, anti-cheat) also clears the item
+          // -- retrying it forever would never succeed. Only a transport
+          // failure keeps it parked, and that lands in the catch below.
+          if (res) okCount++;
           step();
         })['catch'](function () { step(); });
       })(batch[i]);
@@ -906,74 +953,120 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 
 
   /* =========================================================================
-   * 6. JSONP TRANSPORT
+   * 6. TRANSPORT -- real fetch(), real CORS, no more JSONP
    * ====================================================================== */
 
   /**
-   * Calls the Apps Script web app by injecting a <script> tag.
+   * fetch() with an AbortController timeout.
    *
-   * Resolves with the parsed object the server passed to our callback.
-   * Rejects on: no URL configured, no DOM, script error, or timeout.
-   * Every rejection path is handled by the caller with a local fallback.
+   * Rejects on: no URL configured, no fetch available, network error, timeout,
+   * or a non-JSON body. Every rejection path is handled by the caller with a
+   * local fallback -- nothing here ever reaches the game as an exception.
    *
-   * @param {Object} params query parameters (callback is added here)
+   * @param {string} path e.g. '/top'
+   * @param {Object} options {method, query, body}
    * @param {number} timeoutMs
-   * @return {Promise<Object>}
+   * @return {Promise<Object>} the parsed JSON payload
    */
-  function jsonp(params, timeoutMs) {
+  function request(path, options, timeoutMs) {
+    var opts = options || {};
+
     return new Promise(function (resolve, reject) {
 
       if (!CFG.url) { reject(new Error('no-url')); return; }
-      if (typeof document === 'undefined' || !document.createElement) {
-        reject(new Error('no-dom')); return;
-      }
+      if (typeof fetch !== 'function') { reject(new Error('no-fetch')); return; }
 
-      seq++;
-      var cbName = '__lbcb_' + seq + '_' + Date.now().toString(36);
-      var settled = false;
+      var url = endpoint(path);
+      var query = opts.query ? qs(opts.query) : '';
+      if (query) url += (url.indexOf('?') >= 0 ? '&' : '?') + query;
+
+      var controller = null;
       var timer = null;
-      var script = null;
 
-      function cleanup() {
-        if (timer) { clearTimeout(timer); timer = null; }
-        try { delete global[cbName]; } catch (e) { global[cbName] = undefined; }
-        if (script && script.parentNode) {
-          try { script.parentNode.removeChild(script); } catch (e) {}
-        }
-        script = null;
+      try {
+        if (typeof AbortController === 'function') controller = new AbortController();
+      } catch (e) { controller = null; }
+
+      var init = {
+        method: opts.method || 'GET',
+        // 'omit' keeps this a simple cross-origin request and means the Worker
+        // can safely answer with Access-Control-Allow-Origin: *
+        credentials: 'omit',
+        mode: 'cors'
+      };
+
+      if (controller) init.signal = controller.signal;
+
+      if (opts.body !== undefined && opts.body !== null) {
+        init.body = JSON.stringify(opts.body);
+        // text/plain, not application/json, ON PURPOSE. It keeps the POST a
+        // "simple" CORS request, so the browser skips the OPTIONS preflight and
+        // the whole submit is one round trip instead of two -- which matters on
+        // store Wi-Fi. The Worker parses the body as JSON regardless, and it
+        // still answers OPTIONS properly for anything that does preflight.
+        init.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
       }
 
+      var settled = false;
       function finish(fn, arg) {
         if (settled) return;
         settled = true;
-        cleanup();
+        if (timer) { clearTimeout(timer); timer = null; }
         fn(arg);
       }
 
-      // The server calls this global by name.
-      global[cbName] = function (data) {
-        finish(resolve, data || {});
-      };
-
       timer = setTimeout(function () {
+        try { if (controller) controller.abort(); } catch (e) {}
         finish(reject, new Error('timeout'));
       }, timeoutMs || TIMEOUT_MS);
 
-      var query = qs(params) + '&callback=' + encodeURIComponent(cbName);
-      var sep   = CFG.url.indexOf('?') >= 0 ? '&' : '?';
+      var p;
+      try {
+        p = fetch(url, init);
+      } catch (e) {
+        finish(reject, new Error('network'));
+        return;
+      }
 
-      script = document.createElement('script');
-      script.src   = CFG.url + sep + query;
-      script.async = true;
-      script.onerror = function () { finish(reject, new Error('network')); };
+      if (!p || typeof p.then !== 'function') {
+        finish(reject, new Error('network'));
+        return;
+      }
 
-      // Apps Script serves the callback wrapped in text/javascript; some
-      // browsers are picky if we do not say so.
-      script.type = 'text/javascript';
-
-      var host = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
-      host.appendChild(script);
+      p.then(function (res) {
+        // A 4xx from the Worker still carries a useful JSON body
+        // ({ok:false,error:"..."}) -- a bad name, the rate limiter, the
+        // anti-cheat ceiling. Those are real answers: parse them and let the
+        // caller show the reason.
+        //
+        // A 5xx is different. It means the Worker could not do its job (KV
+        // refusing writes, a deploy in flight, Cloudflare having a moment).
+        // Treat it as a TRANSPORT failure so the submit is parked and retried
+        // later, exactly like a timeout, instead of being reported to the rep
+        // as "your score was rejected".
+        if (res.status >= 500) {
+          return Promise.reject(new Error('server-' + res.status));
+        }
+        return res.text().then(function (text) {
+          var data;
+          try { data = JSON.parse(text); }
+          catch (e) { throw new Error('bad-json'); }
+          return data || {};
+        });
+      }).then(function (data) {
+        finish(resolve, data);
+      })['catch'](function (err) {
+        finish(reject, err || new Error('network'));
+      });
     });
+  }
+
+  function getJson(path, query, timeoutMs) {
+    return request(path, { method: 'GET', query: query }, timeoutMs);
+  }
+
+  function postJson(path, body, timeoutMs) {
+    return request(path, { method: 'POST', body: body }, timeoutMs);
   }
 
   /** Records the outcome of a remote call so isOnline() means something. */
@@ -1017,8 +1110,9 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
   }
 
   /**
-   * A stable, anonymous per-device id. Used only for rate limiting -- it is
-   * random, it is not tied to a person, and clearing site data resets it.
+   * A stable, anonymous per-device id. Used for rate limiting and as half of
+   * the server's row key -- it is random, it is not tied to a person, and
+   * clearing site data resets it.
    */
   function clientId() {
     var id = lsGet(K_CLIENT);
@@ -1031,7 +1125,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 
 
   /* =========================================================================
-   * 8. PUBLIC API
+   * 8. PUBLIC API   (identical surface to v1 -- drop-in replacement)
    * ====================================================================== */
 
   var LB = {
@@ -1039,7 +1133,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
     version: VERSION,
 
     /**
-     * Point the adapter at the Apps Script deployment.
+     * Point the adapter at the Cloudflare Worker.
      * @param {{url:?string, district:?string}} options
      *        url may be null/empty -- the adapter then runs fully offline.
      */
@@ -1047,19 +1141,23 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       var o = options || {};
       CFG.url = (o.url === null || o.url === undefined) ? '' : String(o.url).trim();
 
-      // A pasted /dev URL only works while signed in as the owner. Warn, but
-      // do not refuse -- the offline fallback covers it either way.
-      if (CFG.url && typeof console !== 'undefined' && console.warn &&
-          /\/dev\s*$/.test(CFG.url)) {
-        console.warn('[LB] That looks like a /dev URL. Reps need the /exec URL.');
+      // Common paste mistakes, warned about but never fatal -- the offline
+      // fallback covers all of them anyway.
+      if (CFG.url && typeof console !== 'undefined' && console.warn) {
+        if (/script\.google\.com/i.test(CFG.url)) {
+          console.warn('[LB] That is the old Apps Script URL. This adapter wants the Cloudflare *.workers.dev URL.');
+        } else if (!/^https:\/\//i.test(CFG.url)) {
+          console.warn('[LB] The Worker URL should start with https:// -- got: ' + CFG.url);
+        }
       }
 
       if (o.district !== undefined && o.district !== null) {
         CFG.district = cleanDistrict(o.district);
       }
 
-      lastRemoteOk = null;   // re-evaluate on the next call
-      if (CFG.url) queueFlush();   // a URL arriving late drains the backlog
+      lastRemoteOk = null;          // re-evaluate on the next call
+      readCache = { key: '', at: 0, rows: null };
+      if (CFG.url) queueFlush();    // a URL arriving late drains the backlog
       return { url: CFG.url, district: CFG.district };
     },
 
@@ -1115,27 +1213,34 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
         return Promise.resolve(rank(local, n));
       }
 
-      return jsonp({
-        action:   'top',
-        limit:    n,
-        district: district
-      }, TIMEOUT_MS).then(function (res) {
-
-        if (!res || res.ok !== true || !res.rows) {
-          // The server answered, but with an error payload. Treat it as a
-          // failed read -- the board still renders from this device.
-          noteRemote(false);
-          return rank(local, n);
-        }
-
+      // Read cache: the start screen and the game-over screen ask for the board
+      // seconds apart. Reuse the last remote answer rather than refetching.
+      var ckey = n + '|' + district.toLowerCase();
+      if (readCache.rows && readCache.key === ckey &&
+          (Date.now() - readCache.at) < READ_CACHE_MS) {
         noteRemote(true);
-        queueFlush();                    // opportunistic retry of parked scores
-        return merge(res.rows, local, n);
+        return Promise.resolve(merge(readCache.rows, local, n));
+      }
 
-      })['catch'](function () {
-        noteRemote(false);
-        return rank(local, n);           // timeout / network / no DOM
-      });
+      return getJson('/top', { limit: n, district: district }, TIMEOUT_MS)
+        .then(function (res) {
+
+          if (!res || res.ok !== true || !res.rows) {
+            // The server answered, but with an error payload. Treat it as a
+            // failed read -- the board still renders from this device.
+            noteRemote(false);
+            return rank(local, n);
+          }
+
+          noteRemote(true);
+          readCache = { key: ckey, at: Date.now(), rows: res.rows };
+          queueFlush();                  // opportunistic retry of parked scores
+          return merge(res.rows, local, n);
+
+        })['catch'](function () {
+          noteRemote(false);
+          return rank(local, n);         // timeout / network / no fetch
+        });
     },
 
     /**
@@ -1166,9 +1271,9 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 
       // 1. Local board first -- this is the part that cannot fail.
       localUpsert(v);
+      readCache = { key: '', at: 0, rows: null };
 
       var payload = {
-        action:     'submit',
         name:       v.name,
         score:      v.score,
         level:      v.level,
@@ -1181,8 +1286,8 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       };
 
       // 2. No URL configured -- offline by design, and that is a success.
-      //    We still PARK the submission. Every score earned before the Apps
-      //    Script URL is pasted in used to be lost forever; now a later
+      //    We still PARK the submission. Every score earned before the Worker
+      //    URL is pasted in used to be lost forever; now a later
       //    LB.configure({url:...}) drains the backlog on the first read.
       if (!CFG.url) {
         noteRemote(false);
@@ -1195,14 +1300,28 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       }
 
       // 3. Try the server.
-      return jsonp(payload, TIMEOUT_MS).then(function (res) {
+      return postJson('/submit', payload, TIMEOUT_MS).then(function (res) {
 
         if (res && res.ok === true) {
           noteRemote(true);
           queueFlush();
+
+          // The SERVER'S spelling of the name wins. It holds the canonical row;
+          // if this phone typed "jeff k" and the board says "Jeff K", show
+          // "Jeff K" -- and write it back into the local board and identity so
+          // the two copies stop disagreeing.
+          var canonical = cleanName(res.name || v.name) || v.name;
+          if (canonical !== v.name) {
+            localUpsert({
+              name: canonical, score: v.score, level: v.level,
+              district: v.district
+            });
+            setIdentity(canonical, v.district || undefined);
+          }
+
           return {
             ok: true, remote: true,
-            name:     res.name || v.name,
+            name:     canonical,
             best:     res.best !== undefined ? res.best : v.score,
             improved: !!res.improved,
             rank:     res.rank || 0
@@ -1257,6 +1376,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       writeJson(K_BOARD, []);
       writeJson(K_QUEUE, []);
       writeJson(K_IDENTITY, {});
+      readCache = { key: '', at: 0, rows: null };
     },
 
     /**
@@ -1272,6 +1392,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
       rank:               rank,
       merge:              merge,
       qs:                 qs,
+      baseUrl:            baseUrl,
       localRows:          localRows,
       localUpsert:        localUpsert,
       localTop:           localTop,
@@ -1318,6 +1439,7 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 })(typeof window !== 'undefined'
      ? window
      : (typeof globalThis !== 'undefined' ? globalThis : this));
+
 </script>
 
 <script>
@@ -1350,7 +1472,9 @@ canvas{display:block;position:absolute;inset:0;touch-action:none;font-synthesis:
 /* =====================================================================
    §0  LEADERBOARD CONFIG
    ===================================================================== */
-LB.configure({ url: '', district: '' }); // <-- PASTE APPS SCRIPT /exec URL HERE
+LB.configure({ url: '', district: '' }); // <-- PASTE YOUR CLOUDFLARE WORKER BASE URL HERE, e.g. https://c3-fox-run.<you>.workers.dev
+//     Base URL only - no /top, no /submit, no trailing slash. See cloudflare/SETUP.md.
+//     Leave blank and the game runs on each phone's own board, queueing every score to post later.
 
 
 /* =====================================================================
@@ -1423,12 +1547,30 @@ const TUNE = {
   coyoteTime:      0.10,   // 100 ms of forgiveness after leaving the ground
   jumpBuffer:      0.18,   // 180 ms of look-ahead on an early press
 
+  // ---- touch gesture recognition ----
+  // A swipe used to need 38 px of travel measured from the DOWN point, with no
+  // velocity path and no re-anchor on a direction reversal. Two real drops fell
+  // out of that: a short fast flick never reached 38 px, and a thumb that had
+  // already drifted 30 px one way needed 68 px of travel the other way.
+  swipeDist:       38,     // px of travel that always counts as a swipe
+  swipeFlick:      22,     // ...or this much, if it is thrown fast enough
+  swipeFlickSpeed: 0.30,   // px/ms — far above a tap's jitter, below a real flick
+  swipeRearm:      0.09,   // re-arm after a swipe (left-then-right, no lift)
+  swipeTurn:       3,      // px of counter-travel that counts as a reversal
+  swipeIdle:       0.18,   // a pause this long starts a fresh gesture segment, so a
+                           // thumb that RESTS on the glass and then flicks still gets
+                           // the fast path (age was measured from touch-down before)
+  tapSlop:         20,     // px a tap may wander and still be a tap
+  tapMaxMs:        600,    // a resting finger is not a tap
+
   // ---- lane change ----
   laneTime:        0.110,  // fixed 110 ms tween (was a frame-rate-dependent
                            // 62.5 ms exponential that never actually arrived)
   laneOvershoot:   1.15,   // ease-out-back overshoot
-  laneBuffer:      0.12,   // 120 ms input buffer, so the fixed tween can never
-                           // eat an input the old lerp would have accepted
+  laneBuffer:      0.16,   // input buffer, so the fixed tween can never eat an
+                           // input the old lerp would have accepted. It MUST
+                           // outlive laneTime — at 0.12 it cleared 0.110 by only
+                           // 10 ms, so one slow frame dropped a double-tap.
 
   // ---- death ----
   deathHold:       0.90,   // the death actually PLAYS before the menu appears
@@ -1458,13 +1600,46 @@ const TUNE = {
   // ---- entity sizing: ALL derived from p.roadHalf. No pixel floors, ever. ----
   obstUnits:       0.95,  // S = o.w * roadHalf * obstUnits
   lowBarrierW:     1.50,  // low barrier width  = o.w * roadHalf * this
-  lowBarrierH:     0.42,  // ...and height as a fraction of that width
+  /* BUGFIX: the fallback barrier was drawn at 0.42 x its own width (~31px)
+     while the sprite path draws w/aspect = w*0.891 (~73px) and the fox is only
+     lifted clear from jumpY 0.150. Between jumpY 0.073 and 0.150 the procedural
+     barrier was therefore drawn BELOW the fox's feet and still killed him. The
+     factor is now the sprite's own reciprocal aspect, so both paths draw the
+     identical box and the "drawn clear" threshold is the gameplay threshold. */
+  lowBarrierH:     0.89,  // ...and height as a fraction of that width
   orbUnits:        0.17,  // orb S = roadHalf * this
   orbHover:        0.20,  // orb centre floats this * roadHalf above the ground
   orbHighLift:     0.48,  // extra lift for "high" orbs (matches max visual jump lift)
   scenFlag:        0.50,  // scenery heights, in units of roadHalf
   scenSign:        0.38,
   scenTree:        0.36,
+  scenPine:        0.62,  // procedural fallbacks for the region props
+  scenBarn:        0.58,
+  scenTurbine:     0.92,
+  scenWalkup:      0.86,
+  scenFence:       0.16,
+  scenCorn:        0.24,
+
+  // ---- camera (all capped; every one of them is off under reduced-motion) ----
+  camLeanX:        0.055,  // lateral offset, as a fraction of W, per unit lane error
+  camLeanMax:      0.024,  // ...hard cap, fraction of W (keeps the fox clear of the buttons)
+  camRoll:         0.030,  // roll radians per unit lane error
+  camRollMax:      0.018,  // ...hard cap, radians (~1 degree — deliberately tiny)
+  camSpring:       9.0,    // how fast the camera catches up / eases out
+  camPullMax:      0.034,  // view pull-back at top speed (FOV units)
+  camKickX:        0.016,  // near-miss lateral kick, fraction of W
+  camKickDecay:    5.2,
+  nearSlowT:       0.13,   // near-miss slow-motion window
+  nearSlowMo:      0.55,   // ...time scale at the bottom of it
+
+  // ---- environmental animation ----
+  mistCount:       9,
+  birdEvery:       15,     // seconds between flock crossings (plus jitter)
+  birdCross:       9.5,    // seconds to cross the sky
+  fireflies:       26,
+  trafficCars:     10,
+  trainEvery:      11,     // seconds between L-train crossings
+  trainCross:      4.2,
   tagUnits:        1.90,  // nameTag width in units of S
   tagMaxW:         0.30,  // ...but never wider than this fraction of the screen
   tagFadeFrom:     0.72,  // labels fade out as the entity gets close (read-ahead only)
@@ -1488,9 +1663,14 @@ const TUNE = {
   streakMax:       14,
 
   // ---- late-game complexity (see spawnObstacle) ----
+  // speed caps at L15 and the pattern odds all capped by L18, so from L19 the
+  // game was bit-for-bit identical forever. Speed must NOT rise (the reaction
+  // budget is already ~390 ms at cap, near the 375 ms floor for a 3-way choice),
+  // so COMPLEXITY is what keeps climbing.
   complexFrom:     18,
-  driftChance:     0.34, driftTime: 0.45,
-  gateChance:      0.30, gateGap:   0.28,
+  driftChance:     0.34, driftStep: 0.025, driftMax: 0.62, driftTime: 0.45,
+  gateChance:      0.30, gateStep:  0.020, gateMax:  0.50, gateGap: 0.28,
+  mixedFrom:       6,    mixedStep: 0.045, mixedMax: 0.80,
 
   // ---- particle budget ----
   maxParticles:    260, maxFloaters: 24, maxRings: 14, maxConfetti: 120,
@@ -1660,40 +1840,128 @@ const HAZIDS = ['exception','falloff','chargeback','nonusage','retail360'];
 const HAZLBL = { exception:'EXCEPTION', falloff:'FALL-OFF', chargeback:'CHARGE BACK',
                  nonusage:'NON-USAGE', retail360:'RETAIL 360' };
 
-/* 12 themes — palettes extended with ambient/key-light/parallax colours so the
-   new lighting and parallax layers stay on-theme. */
+/* =====================================================================
+   THE ROUTE — 12 stages, south to north, dawn to night.
+   The run is a road trip from the east Tennessee mountains to downtown
+   Chicago: every level moves you further up the map and further into the
+   day. Palette carries the light (dawn -> day -> golden -> dusk -> night),
+   `fark`/`midk`/`neark` carry the LANDFORM, `props` carries what grows or
+   is built beside the road, and the env flags carry what MOVES.
+
+   env flags:  mist birds fireflies traffic turbines stacks ltrain
+               water shimmer haze wind rays fog stars moon sun sodium city
+   ===================================================================== */
 const THEMES = [
-  {name:'DAYTIME',      skyT:'#1aa3e8',skyM:'#5cc6f5',skyB:'#cdeeff', grT:'#5fd24a',grB:'#2faa39', rdT:'#5a5e6a',rdB:'#7a7e8a', sun:'#fff3b0', rays:1, clouds:'#ffffff',
-                        amb:'#cfe8ff', ambA:0.10, key:'#fff6d0', keyA:0.30, keyDir:-1, far:'#8fbfe0', mid:'#6fa8cf', near:'#3d8f43'},
-  {name:'GOLDEN HOUR',  skyT:'#f06f33',skyM:'#f7a85a',skyB:'#ffe0a8', grT:'#7fb83e',grB:'#5a8a2c', rdT:'#645750',rdB:'#7e6d62', sun:'#fff0c8', sunLow:1, rays:1, clouds:'#ffe2c0',
-                        amb:'#ffd8a0', ambA:0.16, key:'#fff0c0', keyA:0.42, keyDir:1,  far:'#e0a377', mid:'#c8875f', near:'#6f8f3c'},
-  {name:'FOGGY DAWN',   skyT:'#9fb4c4',skyM:'#c2d2dd',skyB:'#e3ecf1', grT:'#5a8a52',grB:'#3f6b3a', rdT:'#62656d',rdB:'#7c7f87', clouds:'#eef3f6', fog:1,
-                        amb:'#dfeaf0', ambA:0.20, key:'#ffffff', keyA:0.16, keyDir:-1, far:'#c3d2dc', mid:'#a9bcc8', near:'#4e7a4a'},
-  /* was a single-value theme: sky, ground and both parallax bands all sat in
-     an L*72-88 window, so the horizon line literally did not exist. The ground
-     and the two near bands are pushed down ~20 L*, the sky up. */
-  {name:'DESERT HEAT',  skyT:'#e8b25a',skyM:'#f4d18a',skyB:'#ffe39a', grT:'#d9bd7a',grB:'#a8874d', rdT:'#8a7a5e',rdB:'#9f8d6c', sun:'#fff4d0', sunLow:1, rays:1, shimmer:1, clouds:'#fde7c2',
-                        amb:'#ffe7b0', ambA:0.14, key:'#fffbe0', keyA:0.40, keyDir:1,  far:'#d9b783', mid:'#a07c4a', near:'#7a6440'},
-  {name:'TWILIGHT',     skyT:'#241f5e',skyM:'#5b4a93',skyB:'#b083bf', grT:'#3a5a40',grB:'#274028', rdT:'#4a4c58',rdB:'#64646e', stars:1,
-                        amb:'#6a5cae', ambA:0.20, key:'#e0b8ff', keyA:0.26, keyDir:-1, far:'#4b3f7d', mid:'#3a3163', near:'#2c4a30'},
-  {name:'NEON DISTRICT',skyT:'#2a0d4a',skyM:'#5b1a8c',skyB:'#a83bb0', grT:'#1e2a3a',grB:'#142030', rdT:'#241f36',rdB:'#342e48', stars:1, city:1, neon:1,
-                        amb:'#7b2ea8', ambA:0.22, key:'#ff6ad5', keyA:0.34, keyDir:1,  far:'#43155f', mid:'#2d0f42', near:'#16202e'},
-  {name:'NIGHT CITY',   skyT:'#070d28',skyM:'#161d48',skyB:'#322c5c', grT:'#1d3322',grB:'#122418', rdT:'#323440',rdB:'#464856', moon:1, stars:1, city:1,
-                        amb:'#2a3566', ambA:0.24, key:'#cfe0ff', keyA:0.26, keyDir:-1, far:'#1b2148', mid:'#121736', near:'#16281a'},
-  {name:'AURORA',       skyT:'#04122a',skyM:'#0a2240',skyB:'#123a4a', grT:'#16302a',grB:'#0e231c', rdT:'#2d3038',rdB:'#40444c', stars:1, aurora:1, moon:1,
-                        amb:'#1d5a5a', ambA:0.22, key:'#8affd8', keyA:0.30, keyDir:1,  far:'#0d2a3c', mid:'#0a1f2c', near:'#12281f'},
-  {name:'BLOOD MOON',   skyT:'#2a0a12',skyM:'#4a1020',skyB:'#6e1a2a', grT:'#2a2218',grB:'#1c1810', rdT:'#3a2c30',rdB:'#4d3e44', moon:1, moonCol:'#e85548', moonGlow:'rgba(220,80,60,', stars:1,
-                        amb:'#5c1a24', ambA:0.24, key:'#ff8a70', keyA:0.32, keyDir:-1, far:'#3d1119', mid:'#2a0c12', near:'#241d12'},
-  /* had no chroma anchor at all — every hue a desaturated grey inside a 20 L*
-     window. `far` goes cold blue, the ground goes green, and the near treeline
-     carries warm sodium street lamps as the one warm break. */
-  {name:'SIGNAL STORM', skyT:'#2f333b',skyM:'#474c56',skyB:'#6a6f78', grT:'#3f5c2e',grB:'#283a1e', rdT:'#3a3c44',rdB:'#51535c', rain:1, lightning:1, clouds:'#9aa0a8', sodium:1,
-                        amb:'#5c626c', ambA:0.20, key:'#dfe6f0', keyA:0.20, keyDir:1,  far:'#46566b', mid:'#3a4a52', near:'#2c4423'},
-  {name:'SNOW SQUALL',  skyT:'#9aa6b2',skyM:'#c2cdd6',skyB:'#e6edf2', grT:'#eef4f8',grB:'#d3dee4', rdT:'#6a6e76',rdB:'#83878f', snow:1, clouds:'#eef3f6',
-                        amb:'#dce6ee', ambA:0.20, key:'#ffffff', keyA:0.26, keyDir:-1, far:'#b9c6d1', mid:'#a2b0bd', near:'#dfe9ef'},
-  {name:'CYBER GRID',   skyT:'#0a0420',skyM:'#1a0838',skyB:'#2a0d4a', grT:'#0e0a1a',grB:'#080610', rdT:'#171224',rdB:'#221c30', stars:1, neon:1,
-                        amb:'#2a0d4a', ambA:0.26, key:'#38e8ff', keyA:0.34, keyDir:1,  far:'#1c0836', mid:'#130525', near:'#0d0a18'}
+  /* 1 ------------------------------------------------- east Tennessee */
+  {name:'SMOKY DAWN', reg:'EAST TENNESSEE', hero:'smokies', heroF:0.45,
+   skyT:'#101a42',skyM:'#31456f',skyB:'#93a6bd', grT:'#2d4a44',grB:'#1a2f2d', rdT:'#383d48',rdB:'#4e535e',
+   clouds:'#a8bccf', stars:1, fog:1, mist:1.0, wind:0.5,
+   fark:'ridge', midk:'ridge', neark:'trees',
+   props:['pine','pine','tree','sign'],
+   amb:'#8fa8c8', ambA:0.22, key:'#cfe0ff', keyA:0.26, keyDir:-1,
+   far:'#3b5375', mid:'#2b3f58', near:'#1e352c'},
+
+  /* 2 ------------------------------------------------- the sun breaks */
+  {name:'TENNESSEE SUNRISE', reg:'THE FOOTHILLS', hero:'smokies', heroF:0.40,
+   skyT:'#39498a',skyM:'#d4794a',skyB:'#ffd7a2', grT:'#4f7a3e',grB:'#2f5029', rdT:'#584f47',rdB:'#736a5f',
+   sun:'#fff0c8', sunLow:1, rays:1, clouds:'#ffd9b4', mist:0.55, birds:1, wind:0.7,
+   fark:'ridge', midk:'hills', neark:'trees',
+   props:['pine','tree','pine','flag'],
+   amb:'#ffcf9a', ambA:0.18, key:'#fff2cc', keyA:0.42, keyDir:1,
+   far:'#6b6a9c', mid:'#8c6b78', near:'#3d6a33'},
+
+  /* 3 ------------------------------------------------ up on the plateau */
+  {name:'CUMBERLAND PLATEAU', reg:'THE HIGH ROAD', heroF:0,
+   skyT:'#1273c8',skyM:'#57a8e2',skyB:'#c8e2f0', grT:'#8fae4e',grB:'#5c7a34', rdT:'#6a6a70',rdB:'#8c8c92',
+   sun:'#fff6c8', rays:1, clouds:'#ffffff', shimmer:1, birds:1, wind:0.8,
+   fark:'plateau', midk:'plateau', neark:'trees',
+   props:['pine','tree','sign','pine'],
+   amb:'#d6ecff', ambA:0.10, key:'#fff8dc', keyA:0.32, keyDir:-1,
+   far:'#93a8ae', mid:'#7b9077', near:'#4d7a38'},
+
+  /* 4 ------------------------------------------------ horse country */
+  {name:'KENTUCKY BLUEGRASS', reg:'HORSE COUNTRY', heroF:0,
+   skyT:'#2a92e0',skyM:'#6cc3ef',skyB:'#ddf1ff', grT:'#63c47a',grB:'#347f4e', rdT:'#63656e',rdB:'#83858e',
+   clouds:'#ffffff', birds:1, wind:1.0,
+   fark:'hills', midk:'hills', neark:'fence',
+   props:['barn','tree','fence','sign'],
+   amb:'#d6ecff', ambA:0.11, key:'#fffbe8', keyA:0.30, keyDir:1,
+   far:'#7fb0cc', mid:'#5f9e78', near:'#2f7d46'},
+
+  /* 5 ------------------------------------------------ river city outskirts */
+  {name:'LOUISVILLE HAZE', reg:'OHIO VALLEY', heroF:0,
+   skyT:'#3f7fb8',skyM:'#8fb2c8',skyB:'#e3cfa8', grT:'#6f9a46',grB:'#476b32', rdT:'#5e594c',rdB:'#7a7565',
+   clouds:'#e8dcc4', haze:1, traffic:1, city:1, birds:1, wind:0.7,
+   fark:'city', midk:'hills', neark:'trees',
+   props:['barn','tree','sign','flag'],
+   amb:'#e8d0a8', ambA:0.16, key:'#fff4d8', keyA:0.32, keyDir:1,
+   far:'#8a94a0', mid:'#6f8574', near:'#42642f'},
+
+  /* 6 ------------------------------------------------ the crossing */
+  {name:'OHIO RIVER', reg:'THE CROSSING', heroF:0,
+   skyT:'#1f86d6',skyM:'#63b8ea',skyB:'#d2e8f4', grT:'#5aa86a',grB:'#3a7a52', rdT:'#5f6672',rdB:'#7d8490',
+   clouds:'#ffffff', water:1, birds:1, wind:0.8,
+   fark:'hills', midk:'ridge', neark:'trees',
+   props:['tree','sign','flag','tree'],
+   amb:'#cfe8ff', ambA:0.12, key:'#fdfff0', keyA:0.30, keyDir:-1,
+   far:'#87b6cf', mid:'#6f9fbe', near:'#3d7f55'},
+
+  /* 7 ------------------------------------------------ flat farmland */
+  {name:'INDIANA CORN', reg:'HOOSIER FARMLAND', heroF:0,
+   skyT:'#3f8fd0',skyM:'#a3c8e2',skyB:'#ffe6b8', grT:'#b3ab48',grB:'#7c8734', rdT:'#6b6152',rdB:'#8a8070',
+   sun:'#fff0c0', sunLow:1, rays:1, clouds:'#ffe8c8', wind:1.4, birds:1,
+   fark:'flat', midk:'flat', neark:'corn',
+   props:['barn','corn','barn','sign'],
+   amb:'#ffe3ac', ambA:0.17, key:'#fff4cc', keyA:0.40, keyDir:1,
+   far:'#c3bb90', mid:'#a8a862', near:'#8a8f3c'},
+
+  /* 8 ------------------------------------------------ turbines at dusk */
+  {name:'HOOSIER DUSK', reg:'NORTHERN INDIANA', heroF:0,
+   skyT:'#2a2f68',skyM:'#7a5a8e',skyB:'#f0a172', grT:'#3d5240',grB:'#223126', rdT:'#464852',rdB:'#5c5e68',
+   sun:'#ffd7a0', sunLow:1, clouds:'#c8869a', stars:1, turbines:1, fireflies:1, wind:1.2,
+   fark:'flat', midk:'flat', neark:'corn',
+   props:['turbine','barn','corn','turbine'],
+   amb:'#6b5a92', ambA:0.22, key:'#ffc79a', keyA:0.34, keyDir:1,
+   far:'#4a4272', mid:'#39325a', near:'#2a3a2c'},
+
+  /* 9 ------------------------------------------------ the steel belt */
+  {name:'GARY STEEL', reg:'THE LAKE PLAIN', heroF:0,
+   skyT:'#151a3c',skyM:'#3b3050',skyB:'#8a5a52', grT:'#2e3230',grB:'#1a1d1c', rdT:'#3a3a42',rdB:'#50505a',
+   stars:1, sodium:1, stacks:1, traffic:1, city:1, wind:0.8,
+   fark:'stacks', midk:'city', neark:'trees',
+   props:['turbine','sign','walkup','turbine'],
+   amb:'#4a3a52', ambA:0.24, key:'#ffb070', keyA:0.36, keyDir:1,
+   far:'#2f2a48', mid:'#231f38', near:'#242826'},
+
+  /* 10 ----------------------------------------------- blue hour on the lake */
+  {name:'LAKESHORE', reg:'LAKE MICHIGAN', heroF:0,
+   skyT:'#0d1638',skyM:'#263c70',skyB:'#7386ac', grT:'#25384a',grB:'#131f29', rdT:'#33353f',rdB:'#484a54',
+   stars:1, moon:1, water:1, haze:1, traffic:1, clouds:'#5a6f96', wind:0.9,
+   fark:'city', midk:'ridge', neark:'trees',
+   props:['tree','sign','flag','tree'],
+   amb:'#2c3f6e', ambA:0.24, key:'#bcd6ff', keyA:0.30, keyDir:-1,
+   far:'#1d2c52', mid:'#15203a', near:'#1a2a33'},
+
+  /* 11 ----------------------------------------------- the skyline appears */
+  {name:'CHICAGO SKYLINE', reg:'THE CITY AHEAD', hero:'chicago', heroF:0.82,
+   skyT:'#060c22',skyM:'#141d44',skyB:'#333a66', grT:'#1d2a2a',grB:'#101818', rdT:'#32343e',rdB:'#464853',
+   stars:1, moon:1, city:1, traffic:1, sodium:1,
+   fark:'city', midk:'city', neark:'trees',
+   props:['walkup','sign','tree','walkup'],
+   amb:'#28336a', ambA:0.24, key:'#cfe0ff', keyA:0.28, keyDir:-1,
+   far:'#101836', mid:'#0c1229', near:'#16211f'},
+
+  /* 12 ----------------------------------------------- downtown, tracks overhead */
+  {name:'THE LOOP', reg:'DOWNTOWN CHICAGO', heroF:0,
+   skyT:'#04081c',skyM:'#0e1432',skyB:'#20264c', grT:'#22262e',grB:'#14171d', rdT:'#2a2c36',rdB:'#3d3f4a',
+   stars:1, city:1, sodium:1, ltrain:1, traffic:1,
+   fark:'city', midk:'city', neark:'stoop',
+   props:['walkup','walkup','sign','walkup'],
+   amb:'#1c2450', ambA:0.26, key:'#ffcf9a', keyA:0.32, keyDir:1,
+   far:'#0d1230', mid:'#141a3a', near:'#171c22'}
 ];
+/* The rank ladder is deliberately SEPARATE from the place: where you are on
+   the map and how good you are at the job are two different axes. */
 const TIERS = ['ROOKIE','SPECIALIST','CLOSER','TOP PERFORMER','DISTRICT MGR','REGIONAL','LEGEND','HALL OF FAME'];
 const tierOf = lv => TIERS[Math.min(TIERS.length-1, Math.floor((lv-1)/2))];
 
@@ -2377,6 +2645,91 @@ function bakeAll(theme){
     BAKE.cloud = BAKE.clouds[0];
   }
 
+  /* ---------- HERO BACKDROP ----------
+     bg_smokies / bg_chicago are wide painted plates that do NOT tile: they
+     are baked into a DOUBLE-WIDTH canvas as [image][mirrored image], which
+     makes both seams a duplicated column, i.e. seamless by construction. The
+     feathered edges and the horizon haze pass hide the mirror itself. Theme
+     light is applied here, once, so the runtime cost is a clipped blit. */
+  BAKE.hero = null; BAKE.heroW = 0; BAKE.heroH = 0;
+  if (theme.hero && theme.heroF > 0){
+    const hspr = Art.get(theme.hero === 'smokies' ? 'bg_smokies' : 'bg_chicago');
+    if (hspr){
+      const asp = hspr.fw / hspr.fh;
+      let hH = Math.round(hy * theme.heroF);
+      let hW = Math.round(hH * asp);
+      // a mirror pair narrower than the viewport would repeat on screen
+      if (hW * 2 < W * 1.15){ hW = Math.ceil(W * 0.60); hH = Math.round(hW / asp); }
+      const { c, g } = bakeCanvas('hero', hW*2*DPR, hH*DPR);
+      g.scale(DPR, DPR);
+      g.drawImage(hspr.img, 0, 0, hspr.fw, hspr.fh, 0, 0, hW, hH);
+      g.save(); g.translate(hW*2, 0); g.scale(-1, 1);
+      g.drawImage(hspr.img, 0, 0, hspr.fw, hspr.fh, 0, 0, hW, hH);
+      g.restore();
+      /* source-atop for both washes: 'multiply' is composited source-over in
+         canvas, so it would paint the fill straight over the transparent sky. */
+      g.globalCompositeOperation = 'source-atop';
+      g.globalAlpha = Math.min(0.45, theme.ambA*1.5);
+      g.fillStyle = theme.amb; g.fillRect(0, 0, hW*2, hH);
+      g.globalAlpha = 1;
+      /* Distance haze, weighted to the BASE of the plate: a skyline is hazier
+         at street level than at the crown, and a flat wash was eating the
+         window lights that make the Chicago plate read as a city at all. */
+      const hz = g.createLinearGradient(0, 0, 0, hH);
+      hz.addColorStop(0,    hexA(theme.skyM, 0.05));
+      hz.addColorStop(0.55, hexA(theme.skyB, 0.12));
+      hz.addColorStop(0.85, hexA(theme.skyB, 0.30));
+      hz.addColorStop(1,    hexA(theme.skyB, 0.52));
+      g.fillStyle = hz; g.fillRect(0, 0, hW*2, hH);
+      g.globalCompositeOperation = 'source-over';
+      BAKE.hero = c; BAKE.heroW = hW*2; BAKE.heroH = hH;
+    }
+  }
+
+  /* ---------- ONE soft blob, reused by mist, haze and smokestack plume ---- */
+  if (!BAKE.blob){
+    const BS = 192, { c, g } = bakeCanvas('blob', BS, BS*0.5);
+    const bg2 = g.createRadialGradient(BS*0.5, BS*0.25, 0, BS*0.5, BS*0.25, BS*0.5);
+    bg2.addColorStop(0,    'rgba(255,255,255,0.85)');
+    bg2.addColorStop(0.45, 'rgba(255,255,255,0.34)');
+    bg2.addColorStop(0.78, 'rgba(255,255,255,0.09)');
+    bg2.addColorStop(1,    'rgba(255,255,255,0)');
+    g.fillStyle = bg2; g.fillRect(0, 0, BS, BS*0.5);
+    BAKE.blob = c;
+  }
+
+  /* ---------- MIST ----------
+     Nine big soft blobs blitted live were ~4 M device-pixels of alpha blending
+     a frame on a 3x phone — by far the most expensive thing in this pass. The
+     blobs are composited ONCE into two wrap-around bands instead; the runtime
+     cost is two clipped 1:1 blits of a band the height of a hedgerow, and the
+     two bands scroll at different rates so the parallax survives. */
+  BAKE.mist = null;
+  if (theme.mist && BAKE.blob){
+    const mw = Math.round(W*1.5), mh = Math.max(24, Math.round(hy*0.26));
+    BAKE.mist = [];
+    for (let ly=0; ly<2; ly++){
+      const { c, g } = bakeCanvas('mist'+ly, mw*DPR, mh*DPR);
+      g.scale(DPR, DPR);
+      const rm = lcg(4141 + ly*911 + themeIdx*13);
+      for (let i=0;i<8;i++){
+        const bs = mw*(0.14 + rm()*0.16);
+        g.globalAlpha = (0.20 + rm()*0.26) * theme.mist * (ly ? 0.7 : 1);
+        g.drawImage(BAKE.blob, rm()*mw - bs, mh*(0.10+rm()*0.5) - bs*0.22, bs*2, bs*0.62);
+      }
+      // feather the top so it never shows a straight upper edge against the sky
+      g.globalAlpha = 1;
+      g.globalCompositeOperation = 'destination-out';
+      const fo2 = g.createLinearGradient(0, 0, 0, mh);
+      fo2.addColorStop(0, 'rgba(0,0,0,0.85)'); fo2.addColorStop(0.42, 'rgba(0,0,0,0)');
+      fo2.addColorStop(0.86, 'rgba(0,0,0,0)'); fo2.addColorStop(1, 'rgba(0,0,0,0.7)');
+      g.fillStyle = fo2; g.fillRect(0,0,mw,mh);
+      g.globalCompositeOperation = 'source-over';
+      BAKE.mist.push(c);
+    }
+    BAKE.mistW = mw; BAKE.mistH = mh;
+  }
+
   /* ---------- PARALLAX BANDS ----------
      Each layer is baked 1.5x screen width and wrapped, so it can slide with
      lane changes (camera lateral parallax) and a slow forward drift. */
@@ -2470,15 +2823,144 @@ function bakeAll(theme){
         }
         g.fillStyle = 'rgba(255,70,60,0.85)'; g.fill();
       }
-    } else if (kind === 'hills'){
-      g.fillStyle = color; g.beginPath(); g.moveTo(0,h);
+    } else if (kind === 'hills' || kind === 'ridge' || kind === 'plateau'){
+      /* One family, three profiles. `ridge` is the Appalachian read: two
+         overlapping layers, the back one washed toward the sky so the ridges
+         actually recede. `plateau` is flat-topped with steep shoulders.
+         `hills` is the original rolling profile. */
+      const layers = kind === 'ridge' ? 2 : 1;
+      for (let ly = layers-1; ly >= 0; ly--){
+        const amp  = kind === 'plateau' ? 0.30 : (kind === 'ridge' ? 0.62 : 0.60);
+        const lift = ly ? 0.34 : 0;                       // back layer sits higher
+        g.globalAlpha = alpha * (ly ? 0.55 : 1);
+        g.fillStyle = ly ? mixHex(color, theme.skyB, 0.42) : color;
+        g.beginPath(); g.moveTo(0,h);
+        let x = -W*0.08;
+        while (x < bandW){
+          const w2 = W*(0.10 + rnd()*0.16);
+          const pk = h*(0.30 + lift + rnd()*amp);
+          if (kind === 'plateau'){
+            g.lineTo(x, h);
+            g.lineTo(x + w2*0.16, h - pk);
+            g.lineTo(x + w2*0.84, h - pk*(0.94 + rnd()*0.10));
+            g.lineTo(x + w2, h);
+          } else {
+            g.lineTo(x, h); g.quadraticCurveTo(x + w2*0.5, h - pk, x + w2, h);
+          }
+          x += w2*(kind === 'ridge' ? 0.62 : 0.82);
+        }
+        g.lineTo(bandW, h); g.closePath(); g.fill();
+      }
+      g.globalAlpha = alpha;
+    } else if (kind === 'flat'){
+      /* Indiana: the horizon is a RULE, and the only things on it are grain
+         silos, a barn roof and the odd windbreak of trees. */
+      g.fillStyle = color;
+      g.fillRect(0, h*0.80, bandW, h*0.20);
+      let x = 0;
+      g.beginPath();
+      while (x < bandW){
+        const r = rnd();
+        if (r < 0.26){                                   // silo pair
+          const sw = W*0.012 + rnd()*W*0.008, sh2 = h*(0.42 + rnd()*0.34);
+          g.rect(x, h*0.80-sh2, sw, sh2);
+          g.moveTo(x+sw, h*0.80-sh2); g.arc(x+sw*0.5, h*0.80-sh2, sw*0.5, 0, 3.1416, true);
+          if (rnd()<0.55){ g.rect(x+sw*1.5, h*0.80-sh2*0.72, sw*0.86, sh2*0.72); }
+          x += sw*3.2;
+        } else if (r < 0.52){                            // barn / long shed
+          const bw2 = W*0.05 + rnd()*W*0.05, bh2 = h*(0.20 + rnd()*0.16);
+          g.rect(x, h*0.80-bh2, bw2, bh2);
+          g.moveTo(x, h*0.80-bh2); g.lineTo(x+bw2*0.5, h*0.80-bh2*1.5);
+          g.lineTo(x+bw2, h*0.80-bh2); g.closePath();
+          x += bw2*1.4;
+        } else {                                          // windbreak
+          const n2 = 2 + ((rnd()*4)|0);
+          for (let i=0;i<n2;i++){
+            const tr = h*(0.13+rnd()*0.13);
+            g.moveTo(x+tr, h*0.80); g.arc(x, h*0.80-tr*0.5, tr, 0, 6.2832);
+            x += tr*1.3;
+          }
+          x += W*0.03;
+        }
+        x += W*(0.02 + rnd()*0.07);
+      }
+      g.fill();
+    } else if (kind === 'stacks'){
+      /* Gary: slabs, gantries and chimneys. The plumes are drawn live. */
+      g.fillStyle = color;
+      let x = 0;
+      const stackXs = [];
+      g.beginPath();
+      while (x < bandW){
+        const r = rnd();
+        const bw2 = W*(0.04 + rnd()*0.09), bh2 = h*(0.20 + rnd()*0.34);
+        g.rect(x, h-bh2, bw2, bh2);
+        if (r < 0.42){                                   // chimney on top
+          const cw = Math.max(1.6, bw2*0.10), chh = h*(0.34 + rnd()*0.46);
+          g.rect(x+bw2*0.62, h-bh2-chh, cw, chh);
+          stackXs.push(x+bw2*0.62+cw*0.5, h-bh2-chh);
+        } else if (r < 0.66){                            // gas holder
+          const rr2 = Math.min(bw2*0.5, h*0.24);
+          g.moveTo(x+bw2*0.5+rr2, h-bh2); g.arc(x+bw2*0.5, h-bh2, rr2, 0, 6.2832);
+        }
+        x += bw2 + W*0.008;
+      }
+      g.fill();
+      // gantry line: one long horizontal beam with legs, drawn once
+      g.globalAlpha = alpha*0.8; g.fillStyle = mixHex(color,'#000000',0.30);
+      g.fillRect(0, h*0.56, bandW, Math.max(1.2, h*0.030));
+      for (let lx=0; lx<bandW; lx+=W*0.05) g.fillRect(lx, h*0.56, Math.max(1,h*0.018), h*0.30);
+      g.globalAlpha = alpha;
+      BAKE.stackXs = stackXs;
+    } else if (kind === 'fence'){
+      /* Kentucky: the white plank fence that says horse country in one shape. */
+      const rail = Math.max(1.1, h*0.075), post = Math.max(1.4, h*0.10);
+      g.fillStyle = mixHex(color,'#000000',0.35);
+      g.fillRect(0, h*0.80, bandW, h*0.20);
+      g.fillStyle = '#f2f5ef';
+      g.globalAlpha = alpha*0.92;
+      for (let ry=0.30; ry<0.80; ry+=0.22) g.fillRect(0, h*ry, bandW, rail);
+      for (let px2=0; px2<bandW; px2+=W*0.028) g.fillRect(px2, h*0.26, post, h*0.58);
+      g.globalAlpha = alpha;
+    } else if (kind === 'corn'){
+      /* Indiana: a dense serrated row. Two tones so the wind pass has
+         something to shear against. */
+      for (let pass=0; pass<2; pass++){
+        g.fillStyle = pass ? mixHex(color,'#ffffff',0.16) : mixHex(color,'#000000',0.22);
+        g.globalAlpha = alpha*(pass?0.85:1);
+        g.beginPath();
+        let x = -6;
+        const yb = h*(pass?0.94:1.0);
+        while (x < bandW+6){
+          const ch2 = h*(0.42 + rnd()*0.40)*(pass?0.86:1);
+          g.moveTo(x, yb); g.lineTo(x + h*0.05, yb-ch2); g.lineTo(x + h*0.10, yb);
+          x += h*(0.055 + rnd()*0.035);
+        }
+        g.fill();
+      }
+      g.globalAlpha = alpha;
+      g.fillStyle = mixHex(color,'#000000',0.30); g.fillRect(0, h*0.90, bandW, h*0.10);
+    } else if (kind === 'stoop'){
+      /* The Loop: the near band is a wall of building bases with lit windows. */
+      g.fillStyle = color;
+      g.fillRect(0, h*0.14, bandW, h*0.86);
+      const lit = [];
       let x = 0;
       while (x < bandW){
-        const w2 = W*(0.10 + rnd()*0.14), pk = h*(0.35 + rnd()*0.6);
-        g.lineTo(x, h); g.quadraticCurveTo(x + w2*0.5, h - pk, x + w2, h);
-        x += w2*0.82;
+        const bw2 = W*(0.03 + rnd()*0.04);
+        g.fillStyle = mixHex(color, rnd()<0.5 ? '#ffffff' : '#000000', 0.10);
+        g.fillRect(x, h*(0.10+rnd()*0.14), bw2, h);
+        const step = Math.max(5, bw2/4);
+        for (let wy=h*0.30; wy<h*0.92; wy+=step*1.5)
+          for (let wx=x+step*0.4; wx<x+bw2-step*0.5; wx+=step)
+            if (rnd()<0.42) lit.push(wx, wy, Math.max(1.3,step*0.34), Math.max(1.6,step*0.44));
+        x += bw2 + Math.max(1, W*0.002);
       }
-      g.lineTo(bandW, h); g.closePath(); g.fill();
+      if (lit.length){
+        g.beginPath();
+        for (let i=0;i<lit.length;i+=4) g.rect(lit[i],lit[i+1],lit[i+2],lit[i+3]);
+        g.fillStyle = 'rgba(255,206,140,0.80)'; g.fill();
+      }
     } else { // 'trees' — a near treeline / hedge row
       g.fillStyle = color;
       let x = -10;
@@ -2510,9 +2992,10 @@ function bakeAll(theme){
   const hFar  = Math.round(hy*0.34);
   const hMid  = Math.round(hy*0.26);
   const hNear = Math.round(hy*0.13);
-  BAKE.far  = bakeBand('far',  hFar,  theme.far,  theme.city ? 'city' : 'hills', 1337, 0.95);
-  BAKE.mid  = bakeBand('mid',  hMid,  theme.mid,  theme.city ? 'city' : 'hills', 90210, 1);
-  BAKE.near = bakeBand('near', hNear, theme.near, 'trees', 4242, 1);
+  BAKE.stackXs = null;
+  BAKE.far  = bakeBand('far',  hFar,  theme.far,  theme.fark  || 'hills', 1337, 0.95);
+  BAKE.mid  = bakeBand('mid',  hMid,  theme.mid,  theme.midk  || 'hills', 90210, 1);
+  BAKE.near = bakeBand('near', hNear, theme.near, theme.neark || 'trees', 4242, 1);
   BAKE.farW = BAKE.midW = BAKE.nearW = bandW;
   BAKE.hFar = hFar; BAKE.hMid = hMid; BAKE.hNear = hNear;
 
@@ -2705,11 +3188,17 @@ function ringFx(x,y,color,maxR,tag){
    ===================================================================== */
 let commission=0, combo=1, comboTimer=0, baseSpeed=0, levelBonus=0, speed=0, dist=0;
 let shake=0, flash=0, t=0, invuln=0, shield=0, tsheetTotal=0, prevCombo=1, bestCombo=1;
-let level=1, levelDist=0, levelBanner=0, levelTxt='', levelSub='', lightning=0;
+let level=1, levelDist=0, levelBanner=0, levelTxt='', levelSub='', levelPre='', lightning=0;
 let lane=1, playerX=0, jumpY=0, jumpV=0, coyote=0, jumpBuf=0, wasAirborne=false;
 let hitStop=0, fovPush=0, runSeconds=0, scoreShown=0, comboPulse=0, landSquash=0;
 let prevLane=1, laneT=1, laneFrom=0, laneBuf=0, laneBufT=0, bumpFlash=0, nearGlow=0, nearSide=0;
 let dying=0, deathT=0, timeScale=1;
+let camMargin = 0;   // frame overdraw the camera lean needs (see render)
+/* ---- camera: lateral lean + roll into a lane change, pull-back with speed,
+   and a lateral kick on a near miss. Every one of them is spring-damped, hard
+   capped, and zeroed under prefers-reduced-motion (motion sickness is a real
+   failure mode and this is a game people play on a phone in a car park). ---- */
+let camX=0, camRollV=0, camPull=0, camKick=0, nearSlow=0;
 let chainSum=0, chainCombo=1, chainT=0, chainX=0, chainY=0, chainCol='#fff';
 let obstacles=[], orbs=[], scen=[];
 let devGod = false;          // only settable through the ?dev=1 hook
@@ -2740,7 +3229,8 @@ function spawnGroup(z){
   const twoTallChance = 0.18 + Math.min(0.50, level*0.045);
   // mixedChance used to cap at L13; it now keeps climbing, which is what makes
   // a level-25 layout different from a level-13 one.
-  const mixedChance   = level>=6 ? Math.min(0.60, (level-5)*0.045) : 0;
+  const mixedChance   = level>=TUNE.mixedFrom
+        ? Math.min(TUNE.mixedMax, (level-TUNE.mixedFrom+1)*TUNE.mixedStep) : 0;
   const made = [];
   if (r < lowChance){
     const cnt = 1 + Math.floor(Math.random()*(level>=4?3:2));
@@ -2762,12 +3252,15 @@ function spawnObstacle(){
   if (level < TUNE.complexFrom) return;
   // COMPLEXITY, not speed, is what escalates past L18.
   // (a) a hazard that slides into an adjacent lane while you are reading it
-  if (Math.random() < TUNE.driftChance){
+  const over = level - TUNE.complexFrom;
+  const driftP = Math.min(TUNE.driftMax, TUNE.driftChance + over*TUNE.driftStep);
+  const gateP  = Math.min(TUNE.gateMax,  TUNE.gateChance  + over*TUNE.gateStep);
+  if (Math.random() < driftP){
     const tall = made.filter(o=>!o.low && (o.lane===0||o.lane===2||made.length===1));
     if (tall.length) makeDrifter(tall[Math.floor(Math.random()*tall.length)]);
   }
   // (b) a double gate: two groups 0.28 z apart, so you must plan two beats
-  if (Math.random() < TUNE.gateChance){
+  if (Math.random() < gateP){
     const second = spawnGroup(-TUNE.gateGap);
     // guarantee at least one lane is open across BOTH gates
     const blocked = new Set();
@@ -2798,10 +3291,18 @@ function spawnOrb(){
     orbs.push({nx:LANEX[ln],lane:ln,z:0,pz:0,got:false,ph:Math.random()*6.28,kind:k,high:false,spark:0});
   }
 }
+/* Props are chosen by STAGE, not at random: pines and hardwoods in Tennessee,
+   barns and fence lines through Kentucky, corn and silos in Indiana, turbines
+   at dusk, brick walk-ups approaching the city. It is the single cheapest way
+   to make the road tell you where you are. */
+const SCEN_FALLBACK = ['flag','sign','tree'];
 function addScen(side){
-  const ty = Math.random()<0.4 ? 'flag' : (Math.random()<0.6 ? 'sign' : 'tree');
+  const list = (theme.props && theme.props.length) ? theme.props : SCEN_FALLBACK;
+  const ty = list[(Math.random()*list.length)|0];
+  // wide props stand further out so they never crowd the verge
+  const out = (ty==='barn'||ty==='walkup'||ty==='turbine') ? 1.62 : 1.34;
   // clear of the verge (|nx| <= 1.235) so nothing stands in the gravel
-  scen.push({ nx: side*(1.34+Math.random()*0.46), z:0, side, type:ty, ph:Math.random()*6.28 });
+  scen.push({ nx: side*(out+Math.random()*0.46), z:0, side, type:ty, ph:Math.random()*6.28 });
 }
 function spawnScen(){
   const side = Math.random()<0.5?-1:1;
@@ -2906,13 +3407,18 @@ function measureControls(){
 
 /* first-run coaching */
 const K_COACH = 'c3_coached_v1';
-let coach = 0, coachFade = 0;
+let coach = 0, coachFade = 0, coachHeld = false;
 function coachDone(){
   if (/[?&]coach=1/.test(location.search)) return false;   // force it back on
   if (/[?&]dev=1/.test(location.search))   return true;    // never in the harness
   try{ return !!localStorage.getItem(K_COACH); }catch(e){ return false; }
 }
-function endCoach(){ if (coach > 0) coach = Math.min(coach, TUNE.coachFadeT); }
+/* The coach hold froze update() outright. Any input taken during it set lane /
+   jumpV correctly but the world did not integrate for up to coachFadeT (350 ms),
+   so a first-time player's FIRST press moved nothing for a third of a second —
+   the single worst input latency left in the file. Ending the coach now releases
+   the simulation on the same frame; only the callouts keep fading. */
+function endCoach(){ if (coach > 0){ coach = Math.min(coach, TUNE.coachFadeT); coachHeld = false; } }
 
 /* Canvas swipe / tap. Pointer state is only trusted when the gesture STARTED
    on the canvas, so a press on a button can never fire a phantom jump. */
@@ -2930,7 +3436,7 @@ function endCoach(){ if (coach > 0) coach = Math.min(coach, TUNE.coachFadeT); }
    (it neither moves far enough to swipe nor lifts fast enough to tap). */
 const PTRS = new Map();
 let twoFinger = null;
-const SWIPE = 38, TAP = 20, REARM = 0.09, TAP_MAX_MS = 600;
+const TAP = TUNE.tapSlop, TAP_MAX_MS = TUNE.tapMaxMs;
 cv.addEventListener('pointerdown', e=>{
   if (state === PAUSED){ setPaused(false); return; }
   if (state !== PLAY) return;
@@ -2944,19 +3450,63 @@ cv.addEventListener('pointerdown', e=>{
     const only = PTRS.values().next().value;
     if (now - only.t < 220) twoFinger = { a: only.id, b: e.pointerId, t: now };
   }
-  PTRS.set(e.pointerId, { id:e.pointerId, x:e.clientX, y:e.clientY, t:now, swiped:0 });
+  /* x/y stay the immutable DOWN point (the tap test and the control-band test
+     depend on it). ax/ay are the mutable SWIPE anchor. */
+  PTRS.set(e.pointerId, { id:e.pointerId, x:e.clientX, y:e.clientY, t:now, swiped:0,
+                          ax:e.clientX, ay:e.clientY,      // distance anchor
+                          fx:e.clientX, fy:e.clientY, at:now, // flick anchor + clock
+                          lx:e.clientX, ly:e.clientY, lt:now, sx:0, sy:0 });
 });
 cv.addEventListener('pointermove', e=>{
   if (state !== PLAY) return;
   const s = PTRS.get(e.pointerId); if (!s) return;
-  const dx = e.clientX - s.x, dy = e.clientY - s.y;
+  const now = performance.now();
   // swiped is a TIMESTAMP, not a latch: after a short re-arm the same thumb
   // can swipe again (left-then-right without lifting used to be impossible).
-  if (s.swiped && (performance.now() - s.swiped) < REARM*1000) return;
-  if (Math.abs(dx)>SWIPE && Math.abs(dx)>Math.abs(dy)){
-    moveLane(dx>0?1:-1); s.swiped = performance.now(); s.x=e.clientX; s.y=e.clientY;
-  } else if (dy<-SWIPE && Math.abs(dy)>Math.abs(dx)){
-    requestJump(); s.swiped = performance.now(); s.x=e.clientX; s.y=e.clientY;
+  if (s.swiped && (now - s.swiped) < TUNE.swipeRearm*1000) return;
+
+  /* TWO anchors. ax/ay accumulate DISTANCE and only ever reset on a reversal or
+     a fire. fx/fy/at time the FLICK and also reset after a pause, so a thumb
+     parked on the glass and then thrown is judged on the throw, not on the rest
+     — while a slow, sampled-sparsely drag still accumulates to swipeDist. */
+  if (now - s.lt > TUNE.swipeIdle*1000){ s.fx = s.lx; s.fy = s.ly; s.at = now; }
+  s.lt = now;
+
+  /* A direction reversal re-anchors at the turning point. Without it a thumb
+     that had already drifted 30 px left had to travel 68 px right before a
+     right-swipe registered — one of the real "my input was eaten" cases. */
+  const mx = e.clientX - s.lx, my = e.clientY - s.ly;
+  if (Math.abs(mx) > TUNE.swipeTurn){
+    const d = mx > 0 ? 1 : -1;
+    if (s.sx && d !== s.sx){ s.ax = s.lx; s.fx = s.lx; s.at = now; }
+    s.sx = d;
+  }
+  if (Math.abs(my) > TUNE.swipeTurn){
+    const d = my > 0 ? 1 : -1;
+    if (s.sy && d !== s.sy){ s.ay = s.ly; s.fy = s.ly; s.at = now; }
+    s.sy = d;
+  }
+  s.lx = e.clientX; s.ly = e.clientY;
+
+  const dx = e.clientX - s.ax, dy = e.clientY - s.ay;
+  const gx = e.clientX - s.fx, gy = e.clientY - s.fy;
+  const age = Math.max(1, now - s.at);
+  /* A committed FLICK fires at swipeFlick px instead of swipeDist: a short,
+     fast throw used to travel, stop, and never register at all. The speed gate
+     is an order of magnitude above a stationary tap's jitter, so a tap can
+     never be promoted into a lane change by it. */
+  const fastX = Math.abs(gx) > TUNE.swipeFlick && Math.abs(gx)/age > TUNE.swipeFlickSpeed
+                && Math.abs(gx) > Math.abs(gy);
+  const fastY = Math.abs(gy) > TUNE.swipeFlick && Math.abs(gy)/age > TUNE.swipeFlickSpeed
+                && Math.abs(gy) > Math.abs(gx);
+  const rearm = ()=>{ s.swiped = now; s.ax = e.clientX; s.ay = e.clientY;
+                      s.fx = e.clientX; s.fy = e.clientY;
+                      s.lx = e.clientX; s.ly = e.clientY; s.sx = 0; s.sy = 0;
+                      s.at = now; s.lt = now; };
+  if ((Math.abs(dx) > TUNE.swipeDist && Math.abs(dx) > Math.abs(dy)) || fastX){
+    moveLane((fastX ? gx : dx) > 0 ? 1 : -1); rearm();
+  } else if ((-dy > TUNE.swipeDist && Math.abs(dy) > Math.abs(dx)) || (fastY && gy < 0)){
+    requestJump(); rearm();
   }
 });
 function endPtr(e, tap){
@@ -3044,9 +3594,9 @@ function startGame(){
   /* First run ever on this phone: hold the world and draw callouts over the
      frozen road. Without it there is no instruction of any kind on a phone —
      the keyboard hint is desktop-only and the first hazard arrives in ~2s. */
-  coach = 0;
+  coach = 0; coachHeld = false;
   if (!coachDone()){
-    coach = TUNE.coachHold;
+    coach = TUNE.coachHold; coachHeld = true;
     coachFade = 0;
     // something real to point at for "GRAB THESE"
     for (let i=0;i<3;i++)
@@ -3065,9 +3615,14 @@ function levelUp(){
   theme = THEMES[themeIdx];
   // late levels are short and hard; a 2.4s banner + confetti on every one of
   // them was celebrating over the top of the hardest play in the game.
-  levelBanner = 1.5;
-  levelTxt = 'LEVEL ' + level + ' · ' + tierOf(level);
-  levelSub = theme.name + ' · SPEED UP!';
+  levelBanner = 1.8;
+  /* A level-up is ARRIVING SOMEWHERE, not "SPEED UP". The place is the
+     headline; the rank ladder is demoted to the line underneath, where it
+     belongs — they are two different achievements. */
+  const lap = 1 + Math.floor((level-1)/THEMES.length);
+  levelPre = lap > 1 ? ('LAP ' + lap + ' · NOW ENTERING') : 'NOW ENTERING';
+  levelTxt = theme.name;
+  levelSub = theme.reg + ' · LEVEL ' + level + ' · ' + tierOf(level);
   badgeTxt = '';                       // HUD badge string + width cache
   if (level % 5 === 0) confettiBurst(W/2, H*0.3, 26);
   blip(523,0.12,'square',0.18); blip(659,0.12,'square',0.16);
@@ -3079,6 +3634,25 @@ function update(dt){
 
   // ambient sim runs even on menus so the frozen backdrop is composed properly
   for (const c of clouds){ c.x += c.spd*dt; if (c.x - c.s*2 > W) c.x = -c.s*2; }
+  ENV.update(dt);
+
+  /* ---- camera ----
+     The lean is driven by the LANE ERROR, which is already the quantity the
+     fox's own body tilt uses, so the camera and the character agree. The
+     spring makes it ease out instead of snapping back, and both terms are
+     clamped well inside the range where a swinging horizon starts to hurt. */
+  {
+    const err = REDUCED ? 0 : (LANEX[lane] - playerX);          // -0.62 .. 0.62
+    const wantX = Math.max(-TUNE.camLeanMax, Math.min(TUNE.camLeanMax, err*TUNE.camLeanX)) * W;
+    const wantR = Math.max(-TUNE.camRollMax, Math.min(TUNE.camRollMax, err*TUNE.camRoll));
+    const k = Math.min(1, dt*TUNE.camSpring);
+    camX     += (wantX - camX)*k;
+    camRollV += (wantR - camRollV)*k;
+    if (camKick > 0) camKick -= dt*TUNE.camKickDecay; else camKick = 0;
+    const sn = Math.max(0, Math.min(1, (speed - TUNE.baseSpeedStart) / (TUNE.speedMax - TUNE.baseSpeedStart)));
+    const wantP = REDUCED ? 0 : TUNE.camPullMax*sn*sn;
+    camPull += (wantP - camPull) * Math.min(1, dt*1.6);
+  }
   if (theme.lightning && !REDUCED && Math.random()<0.006) lightning = 1;
   if (lightning>0) lightning -= dt*2.2;
   // FX velocities are per-FRAME quantities; scale them by dt*60 so a 120 Hz
@@ -3122,7 +3696,9 @@ function update(dt){
   } else {
     playerX = LANEX[lane]; prevLane = lane;
   }
-  if (laneBufT > 0){ laneBufT -= dt; if (laneBufT <= 0) laneBuf = 0; }
+  // The buffer only AGES once the tween has settled and had its chance to
+  // consume it; otherwise a stall inside the tween silently eats the press.
+  if (laneBufT > 0 && laneT >= 1){ laneBufT -= dt; if (laneBufT <= 0) laneBuf = 0; }
 
   // ---- jump: coyote + buffer, then integrate ----
   const groundedBefore = jumpY <= TUNE.groundEps;
@@ -3199,6 +3775,10 @@ function update(dt){
       floatText(p.x, p.y - p.roadHalf*0.42, 'NEAR MISS +' + money(bonus), '#8fd8ff', celebSize(0.022), 1);
       hitStop = Math.max(hitStop, TUNE.hitStopNear);
       nearGlow = 1; nearSide = o.nx < playerX ? -1 : 1;
+      /* the near-miss bonus existed but had no CAMERA. It now gets a short
+         lateral kick away from the hazard and a sliver of slow-motion, so the
+         reward is felt in the frame rather than only read in a floater. */
+      if (!REDUCED){ camKick = -nearSide; nearSlow = TUNE.nearSlowT; }
       blip(900, 0.07, 'sine', 0.07); blip(1350, 0.05, 'sine', 0.04);
       buzz(6);
     }
@@ -3671,7 +4251,11 @@ function drawObstacle(o){
   const M = MONSTER[o.id];
   ctx.save(); ctx.globalAlpha = al;
   const spr = litArt(M.key);
-  if (spr) blitSprite(spr, p.x, p.y, U, t);
+  /* The strip is driven by the GAME CLOCK at the sprite's own manifest fps
+     (blitSprite: floor(animT * spr.fps)) — it is not tied to world speed — and
+     o.ph offsets each individual hazard so a row of three never marches in
+     lockstep. */
+  if (spr) blitSprite(spr, p.x, p.y, U, t + o.ph);
   else     M.fn(p.x, p.y, S, o.ph);
   /* Two hazards in adjacent lanes used to overlap their pills into
      "RETAIL 36|RETAIL 360". Lanes 0 and 2 are never adjacent, so raising ONLY
@@ -3815,6 +4399,11 @@ function drawDevice(o){
 }
 
 /* ------------------------------- SCENERY ------------------------------ */
+/* WIND. Anything that grows leans; anything that is built does not. The sway
+   is one sin() and one rotate() about the object's own base, capped at ~2.5
+   degrees, and it is scaled by the stage's wind strength (flat Indiana corn
+   moves most, a still dawn hollow barely at all). */
+const SWAYS = { tree:1, pine:0.75, corn:1.6, fence:0 };
 function drawScen(o){
   const p = project(o.nx, o.z); if (o.z < 0.04) return;
   const al = depthAlpha(o.z);
@@ -3824,10 +4413,24 @@ function drawScen(o){
   const ef = edgeFade(x, 2) * Math.max(0, Math.min(1, (H - by)/(H*0.10) + 0.15));
   if (al*ef <= 0.01) return;
   ctx.save(); ctx.globalAlpha = al*ef;
+
+  /* A rotate() turns an axis-aligned sprite blit into a general transform, so
+     the wind is the first thing to go when the quality ladder drops — and it
+     is never applied to a prop too small on screen to show it. */
+  const sw = (REDUCED || QUALITY.level < 1 || RH < W*0.05)
+             ? 0 : (SWAYS[o.type] || 0) * (theme.wind || 0);
+  if (sw){
+    const a = Math.max(-0.045, Math.min(0.045, Math.sin(t*1.6 + o.ph)*0.020*sw
+                                             + Math.sin(t*3.7 + o.ph*1.7)*0.008*sw));
+    ctx.translate(x, by); ctx.rotate(a); ctx.translate(-x, -by);
+  }
+
   const spr = litArt('scen_'+o.type);
   // the flag's anchor is its pole (ax 0.14): mirror it so the banner always
   // flies away from the road rather than across it
   if (spr){ blitSprite(spr, x, by, RH * TUNE.worldUnit, t, o.type==='flag' && o.side>0); ctx.restore(); return; }
+
+  /* ---------- procedural fallbacks — the ?noart=1 / no-assets path ---------- */
   if (o.type==='flag'){
     const ph = RH*TUNE.scenFlag;
     ctx.strokeStyle='#c8ccd4'; ctx.lineWidth=Math.max(1, ph*0.03); ctx.lineCap='round';
@@ -3851,6 +4454,104 @@ function drawScen(o){
       ctx.fillStyle='#fff'; font(800, bh*0.5, 1); ctx.textAlign='center'; ctx.textBaseline='middle';
       ctx.fillText('XM', x, by-ph-bh/2);
     }
+  } else if (o.type==='pine'){
+    /* a conifer: three stacked skirts, dark green, Tennessee.
+       NB every gradient below is built in LOCAL (translated) space — the cache
+       key is size-only, so a gradient positioned in screen space would be
+       reused at the wrong x for every subsequent instance. */
+    const T = RH*TUNE.scenPine, hw = T*0.24;
+    ctx.save(); ctx.translate(x, by);
+    ctx.fillStyle=amb('#6b4a2e'); ctx.fillRect(-T*0.035, -T*0.16, T*0.07, T*0.16);
+    ctx.fillStyle = lgrad(ck('pine',T), -hw,-T, hw,0,
+      ()=>[[0,amb('#4fae63')],[1,amb('#1d5f3a')]]);
+    ctx.strokeStyle=amb('#14442a'); ctx.lineWidth=Math.max(1, T*0.02);
+    ctx.beginPath();
+    for (let i=0;i<3;i++){
+      const u = i/3, w2 = hw*(0.5+u*0.6), yb = -T*(0.14 + u*0.30), yt = yb - T*0.40;
+      ctx.moveTo(-w2, yb); ctx.lineTo(0, yt); ctx.lineTo(w2, yb); ctx.closePath();
+    }
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  } else if (o.type==='barn'){
+    const T = RH*TUNE.scenBarn, bw = T*0.92, bh = T*0.52;
+    ctx.save(); ctx.translate(x, by);
+    // silo
+    const sw2 = T*0.20, sh2 = T*0.86, sx = bw*0.46;
+    ctx.fillStyle = lgrad(ck('silo',T), -sw2*0.5,0, sw2*0.5,0,
+      ()=>[[0,amb('#d8d2c0')],[0.55,amb('#efeade')],[1,amb('#a89f8c')]]);
+    ctx.save(); ctx.translate(sx, 0);
+    ctx.fillRect(-sw2*0.5, -sh2, sw2, sh2);
+    ctx.beginPath(); ctx.ellipse(0, -sh2, sw2*0.5, sw2*0.34, 0, 3.1416, 6.2832); ctx.fill();
+    ctx.restore();
+    // barn body + gable
+    ctx.fillStyle = lgrad(ck('barn',T), 0,-bh, 0,0, ()=>[[0,amb('#c8402f')],[1,amb('#7e2318')]]);
+    ctx.fillRect(-bw*0.5, -bh, bw, bh);
+    ctx.fillStyle = amb('#3a3f4a');
+    ctx.beginPath(); ctx.moveTo(-bw*0.56, -bh); ctx.lineTo(0, -bh-T*0.30);
+    ctx.lineTo(bw*0.56, -bh); ctx.closePath(); ctx.fill();
+    // white trim + door X
+    ctx.strokeStyle='#f2ece0'; ctx.lineWidth=Math.max(1, T*0.022);
+    ctx.strokeRect(-bw*0.5, -bh, bw, bh);
+    ctx.beginPath();
+    ctx.moveTo(-bw*0.20, 0); ctx.lineTo(bw*0.20, -bh*0.62);
+    ctx.moveTo(bw*0.20, 0); ctx.lineTo(-bw*0.20, -bh*0.62);
+    ctx.stroke();
+    ctx.restore();
+  } else if (o.type==='turbine'){
+    /* tower + a rotor that actually turns — the fallback spins for free */
+    const T = RH*TUNE.scenTurbine, r = T*0.30, hubY = by - T*0.86;
+    ctx.strokeStyle = amb('#e8ecf0'); ctx.lineWidth = Math.max(1.2, T*0.035);
+    ctx.beginPath(); ctx.moveTo(x, by); ctx.lineTo(x, hubY); ctx.stroke();
+    ctx.fillStyle = amb('#f2f5f8');
+    const a0 = t*1.9 + o.ph;
+    ctx.beginPath();
+    for (let b=0;b<3;b++){
+      const a = a0 + b*2.0944, ca = Math.cos(a), sa = Math.sin(a);
+      ctx.moveTo(x, hubY);
+      ctx.lineTo(x + ca*r*0.6 - sa*r*0.10, hubY + sa*r*0.6 + ca*r*0.10);
+      ctx.lineTo(x + ca*r, hubY + sa*r);
+      ctx.lineTo(x + ca*r*0.6 + sa*r*0.10, hubY + sa*r*0.6 - ca*r*0.10);
+      ctx.closePath();
+    }
+    ctx.fill();
+    ctx.beginPath(); ctx.arc(x, hubY, Math.max(1.4, T*0.045), 0, 6.2832); ctx.fill();
+  } else if (o.type==='walkup'){
+    const T = RH*TUNE.scenWalkup, bw = T*0.46;
+    ctx.save(); ctx.translate(x, by);
+    ctx.fillStyle = lgrad(ck('walk',T), -bw*0.5,0, bw*0.5,0,
+      ()=>[[0,amb('#6a3b2c')],[0.6,amb('#8a4c37')],[1,amb('#4e2b20')]]);
+    ctx.fillRect(-bw*0.5, -T, bw, T);
+    ctx.fillStyle = amb('#3a2a24'); ctx.fillRect(-bw*0.56, -T-T*0.035, bw*1.12, T*0.045);
+    const step = bw*0.30;
+    let wi = (o.ph*97)|0;
+    for (let wy=-T*0.92; wy<-T*0.10; wy+=step*1.5){
+      for (let wx=-bw*0.32; wx<bw*0.30; wx+=step){
+        ctx.fillStyle = (wi++ % 3) ? 'rgba(255,208,140,0.85)' : 'rgba(30,36,52,0.85)';
+        ctx.fillRect(wx, wy, step*0.42, step*0.62);
+      }
+    }
+    ctx.restore();
+  } else if (o.type==='fence'){
+    const T = RH*TUNE.scenFence, span = RH*0.9;
+    ctx.strokeStyle = '#f2f5ef'; ctx.lineWidth = Math.max(1, T*0.16); ctx.lineCap='butt';
+    ctx.beginPath();
+    ctx.moveTo(x-span*0.5, by-T*0.85); ctx.lineTo(x+span*0.5, by-T*0.85);
+    ctx.moveTo(x-span*0.5, by-T*0.42); ctx.lineTo(x+span*0.5, by-T*0.42);
+    for (let i=-2;i<=2;i++){ const px2 = x + i*span*0.25; ctx.moveTo(px2, by); ctx.lineTo(px2, by-T*1.05); }
+    ctx.stroke();
+  } else if (o.type==='corn'){
+    const T = RH*TUNE.scenCorn, span = RH*0.8;
+    ctx.save(); ctx.translate(x, by);
+    ctx.strokeStyle = lgrad(ck('corn',T), 0,-T, 0,0,
+      ()=>[[0,amb('#d8c95a')],[1,amb('#6f7a2c')]]);
+    ctx.lineWidth = Math.max(1, T*0.10); ctx.lineCap='round';
+    ctx.beginPath();
+    for (let i=-6;i<=6;i++){
+      const px2 = i*span*0.085, hh2 = T*(0.7 + (((i*37)%10)+10)%10/16);
+      ctx.moveTo(px2, 0); ctx.lineTo(px2 + hh2*0.16, -hh2);
+    }
+    ctx.stroke();
+    ctx.restore();
   } else {
     const T = RH*TUNE.scenTree;
     ctx.fillStyle=amb('#7a5230'); ctx.fillRect(x-T*0.07, by-T*0.28, T*0.14, T*0.28);
@@ -3878,17 +4579,39 @@ function playerShadow(){
   shadowEllipse(p.x, p.y, s*(1.05 - jumpY*0.8), Math.max(0.06, 0.34 - jumpY*0.5));
 }
 function drawFox(x, groundY, s, tilt){
+  /* CRASH CHOREOGRAPHY.
+     player_hit is a 4-frame strip; the death sequence is a 0.9 s hold with a
+     slow-motion ramp in the middle of it. deathT is on the WALL clock (it is
+     incremented before dt is scaled), so the strip is stepped from deathT and
+     plays out at a constant, readable rate no matter how deep the slow-mo
+     goes: 4 frames over the first ~0.62 s, then the last pose holds while the
+     camera settles. It used to be a frozen run pose for the whole 0.9 s. */
+  const crash = dying > 0;
+  let hitSpr = null, hitT = 0;
+  if (crash){
+    hitSpr = litArt('player_hit');
+    if (hitSpr){
+      const n = Math.max(1, hitSpr.frames);
+      const fi = Math.min(n-1, Math.floor(deathT / (TUNE.deathHold*0.72) * n));
+      hitT = (fi + 0.5) / Math.max(1, hitSpr.fps);   // land squarely on frame fi
+    }
+  }
   const key = jumpY > 0.05 ? 'player_jump' : 'player_run';
-  const spr = litArt(key) || litArt('player_run');
+  const spr = hitSpr || litArt(key) || litArt('player_run');
   const lift = jumpY * H * TUNE.playerFootLift;
   const air  = jumpY > 0.05;
 
   // run cycle: bob + squash/stretch + lean. Applied to BOTH paths, so a
   // single-still sprite still reads as running.
-  const bob   = air ? 0 : Math.abs(Math.sin(t*9))*s*0.16;
-  const sqY   = 1 + landSquash*-0.55 + (air ? 0.10 : Math.sin(t*18)*0.035);
-  const sqX   = 1 + landSquash*0.45  + (air ? -0.07 : -Math.sin(t*18)*0.03);
-  const lean  = tilt + (air ? 0.12*Math.sin(t*6) : Math.sin(t*9)*0.03);
+  const dq = crash ? Math.min(1, deathT/0.34) : 0;         // crash ease 0..1
+  const bob   = crash ? -s*0.55*Math.sin(dq*3.1416)
+                      : (air ? 0 : Math.abs(Math.sin(t*9))*s*0.16);
+  const sqY   = crash ? 1 - 0.16*dq
+                      : 1 + landSquash*-0.55 + (air ? 0.10 : Math.sin(t*18)*0.035);
+  const sqX   = crash ? 1 + 0.14*dq
+                      : 1 + landSquash*0.45  + (air ? -0.07 : -Math.sin(t*18)*0.03);
+  const lean  = crash ? (REDUCED ? 0 : -0.42*dq)
+                      : tilt + (air ? 0.12*Math.sin(t*6) : Math.sin(t*9)*0.03);
 
   ctx.save();
   ctx.translate(x, groundY - lift - bob);
@@ -3897,15 +4620,20 @@ function drawFox(x, groundY, s, tilt){
   ctx.translate(-x, -(groundY - lift - bob));
 
   if (spr){
-    blitSprite(spr, x, groundY - lift - bob, (s/TUNE.playerUnits) * TUNE.worldUnit, t);
+    blitSprite(spr, x, groundY - lift - bob, (s/TUNE.playerUnits) * TUNE.worldUnit,
+               hitSpr ? hitT : t);
   } else {
     drawFoxVector(x, groundY - lift - bob, s);
   }
   ctx.restore();
 
   const bodyMidY = groundY - lift - bob - s*0.9;
-  if (combo >= 4){        // fire aura at high combo
-    drawGlow('#ff9c30', x, bodyMidY, s*2.4, 0.28 + 0.10*Math.sin(t*10));
+  /* STREAK CRESCENDO: the aura used to be a switch at combo 4. It now ramps
+     from combo 3 to the cap so the intensity builds with the run. */
+  const ck2 = Math.max(0, Math.min(1, (combo - 2) / (TUNE.comboMax - 2)));
+  if (ck2 > 0 && !crash){
+    drawGlow('#ff9c30', x, bodyMidY, s*(1.5 + 1.3*ck2),
+             (0.10 + 0.24*ck2) + (0.04 + 0.08*ck2)*Math.sin(t*10));
   }
   if (shield > 0){
     // a flat lavender outline circle read as an RTS selection marker; this is
@@ -4019,6 +4747,30 @@ function bakeRoad(){
   gg.addColorStop(0.12, theme.grT);
   gg.addColorStop(1,    theme.grB);
   g.fillStyle = gg; g.fillRect(0, hy, W, gh);
+
+  /* ---- WATER ---- the Ohio crossing and the Lake Michigan shore. Baked into
+     the ground plane and then painted over by the road, so the road reads as a
+     causeway across it; the live shimmer pass rides on top. */
+  if (theme.water){
+    const wh = gh*0.24;
+    const wg = g.createLinearGradient(0, hy, 0, hy+wh);
+    wg.addColorStop(0,   mixHex(theme.skyB, theme.far, 0.35));
+    wg.addColorStop(0.35, mixHex(theme.far,  '#000000', 0.10));
+    wg.addColorStop(1,   mixHex(theme.grB,  theme.far, 0.55));
+    g.fillStyle = wg; g.fillRect(0, hy, W, wh);
+    // a darker far bank line so the water has an opposite shore
+    g.fillStyle = hexA(theme.mid, 0.85); g.fillRect(0, hy, W, Math.max(1.5, gh*0.010));
+    /* the near bank: the water used to meet the grass on a ruled horizontal
+       line across the whole frame. Dissolve it, then lay a wet sand strip. */
+    const fb = g.createLinearGradient(0, hy+wh*0.58, 0, hy+wh*1.16);
+    fb.addColorStop(0, hexA(theme.grT, 0));
+    fb.addColorStop(0.55, hexA(mixHex(theme.grT, theme.far, 0.35), 0.75));
+    fb.addColorStop(1, hexA(theme.grT, 1));
+    g.fillStyle = fb; g.fillRect(0, hy+wh*0.58, W, wh*0.62);
+    g.globalAlpha = 0.30; g.fillStyle = mixHex(theme.grB, '#ffffff', 0.30);
+    g.fillRect(0, hy+wh*1.02, W, Math.max(1.5, wh*0.05)); g.globalAlpha = 1;
+    BAKE.waterY = hy; BAKE.waterH = wh;
+  } else { BAKE.waterY = 0; BAKE.waterH = 0; }
 
   const P = { x:0,y:0,scale:0,roadHalf:0 };
   const _pa = {x:0,y:0,scale:0,roadHalf:0,unit:0}, _pb = {x:0,y:0,scale:0,roadHalf:0,unit:0};
@@ -4134,20 +4886,333 @@ function bakeRoad(){
   FOV = _fov;
 }
 
+/* =====================================================================
+   §13b  THE WORLD AROUND YOU — environmental animation.
+   ---------------------------------------------------------------------
+   Rules this whole section obeys:
+     * nothing allocates inside the frame loop (every list is a fixed pool,
+       seeded on theme change / resize);
+     * nothing uses shadowBlur, filters or per-frame gradients;
+     * every effect declares a MINIMUM QUALITY LEVEL and simply does not run
+       below it, so a struggling phone sheds the world before it sheds frames;
+     * everything is off under prefers-reduced-motion except the two that are
+       pure ambience (mist, haze), which hold still instead.
+   Effects are also PHASE-STAGGERED (see ENV.reseed) so a flock, a train and a
+   plume never all begin on the same frame.
+   ===================================================================== */
+const ENV = {
+  key:'', mistT:0, flies:[], cars:[], plumes:[],
+  bird:{ on:0, t:0, next:6, dir:1, y:0, n:6 },
+  train:{ on:0, t:0, next:5 },
+  q(min){ return QUALITY.level >= min; },
+
+  reseed(){
+    const k = themeIdx + '|' + (W|0) + 'x' + (H|0);
+    if (this.key === k) return;
+    this.key = k;
+    const hy = HORIZON(), r = lcg(0x5eed + themeIdx*7919);
+    // --- fireflies over the fields ---
+    this.flies.length = 0;
+    if (theme.fireflies){
+      for (let i=0;i<TUNE.fireflies;i++) this.flies.push({
+        x: r()*W, y: hy + r()*(H-hy)*0.55,
+        ph: r()*6.28, sp: 0.6 + r()*1.5, amp: 6 + r()*22, blink: 0.4 + r()*1.5
+      });
+    }
+    // --- traffic on the far highway ---
+    this.cars.length = 0;
+    if (theme.traffic){
+      for (let i=0;i<TUNE.trafficCars;i++) this.cars.push({
+        u: r(), dir: i%2 ? 1 : -1, sp: 0.030 + r()*0.030, k: r()
+      });
+    }
+    // --- smokestack plumes (positions come from the baked stacks band) ---
+    this.plumes.length = 0;
+    if (theme.stacks) for (let i=0;i<4;i++) this.plumes.push({ ph: r()*6.28, sp: 0.20+r()*0.16 });
+    // stagger the timed events so they never fire together
+    this.bird.on = 0;  this.bird.next  = 2.5 + r()*TUNE.birdEvery;
+    this.train.on = 0; this.train.next = 1.5 + r()*TUNE.trainEvery;
+  },
+
+  update(dt){
+    this.reseed();
+    const hy = HORIZON();
+    if (!REDUCED) this.mistT += dt;      // the mist bands drift on their own clock
+    // birds: one flock at a time, crossing on a long timer
+    if (theme.birds && this.q(2) && !REDUCED){
+      const b = this.bird;
+      if (b.on){ b.t += dt; if (b.t >= TUNE.birdCross){ b.on = 0; b.next = TUNE.birdEvery*(0.7+Math.random()*0.7); } }
+      else { b.next -= dt; if (b.next <= 0){ b.on = 1; b.t = 0; b.dir = Math.random()<0.5?-1:1;
+             b.y = hy*(0.16 + Math.random()*0.34); b.n = 5 + ((Math.random()*3)|0); } }
+    } else this.bird.on = 0;
+    // the L-train, crossing the background of THE LOOP
+    if (theme.ltrain && this.q(1) && !REDUCED){
+      const tr = this.train;
+      if (tr.on){ tr.t += dt; if (tr.t >= TUNE.trainCross){ tr.on = 0; tr.next = TUNE.trainEvery*(0.7+Math.random()*0.7); } }
+      else { tr.next -= dt; if (tr.next <= 0){ tr.on = 1; tr.t = 0; } }
+    } else this.train.on = 0;
+    // traffic
+    if (this.cars.length && !REDUCED){
+      for (let i=0;i<this.cars.length;i++){
+        const c = this.cars[i];
+        c.u += c.dir*c.sp*dt;
+        if (c.u > 1.08) c.u = -0.08; else if (c.u < -0.08) c.u = 1.08;
+      }
+    }
+  },
+
+  /* ---- SKY LAYER: birds. One path, one stroke, six chevrons. ---- */
+  drawBirds(hy){
+    const b = this.bird;
+    if (!b.on) return;
+    const u = b.t / TUNE.birdCross;
+    const x0 = b.dir > 0 ? -W*0.12 + u*W*1.24 : W*1.12 - u*W*1.24;
+    const sz = Math.max(2.6, W*0.010);
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, Math.sin(u*3.1416)*2.2) * 0.55;
+    ctx.strokeStyle = theme.stars ? 'rgba(190,205,230,1)' : 'rgba(40,52,72,1)';
+    ctx.lineWidth = Math.max(1, sz*0.30); ctx.lineCap = 'round';
+    ctx.beginPath();
+    for (let i=0;i<b.n;i++){
+      const row = (i+1) >> 1, sgn = (i & 1) ? 1 : -1;
+      const bx = x0 - b.dir*row*sz*2.1;
+      const by = b.y + row*sz*1.15*sgn + Math.sin(t*0.8 + i)*sz*0.5;
+      const f = 0.35 + 0.65*Math.abs(Math.sin(t*7.5 + i*0.9));   // wing flap
+      ctx.moveTo(bx - sz, by + sz*f);
+      ctx.lineTo(bx,      by - sz*f*0.35);
+      ctx.lineTo(bx + sz, by + sz*f);
+    }
+    ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ---- BAND LAYER: smokestack plumes rising off the baked stacks ---- */
+  drawPlumes(hy){
+    if (!this.plumes.length || !BAKE.blob || !this.q(1)) return;
+    const xs = BAKE.stackXs;
+    if (!xs || !xs.length) return;
+    const base = hy - BAKE.hFar;
+    /* The stacks live in the FAR band's own coordinate space, so the plumes
+       have to ride the far band's exact scroll offset or they detach from the
+       chimneys they are supposed to be coming out of. */
+    const bw = BAKE.farW;
+    let off = ((-playerX*W*0.10) - (dist*0.008)) % bw;
+    const nx2 = xs.length >> 1;
+    ctx.save();
+    ctx.globalAlpha = 1;
+    for (let i=0;i<this.plumes.length;i++){
+      const pl = this.plumes[i];
+      const j = (((i*Math.max(1,(nx2/this.plumes.length)|0)) % nx2)|0)*2;
+      let sx = xs[j] + off; while (sx < -bw*0.5) sx += bw; while (sx > bw) sx -= bw;
+      if (sx < -W*0.2 || sx > W*1.2) continue;
+      const sy = base + xs[j+1];
+      for (let k2=0;k2<3;k2++){
+        const u = ((t*pl.sp + k2*0.34 + pl.ph) % 1);
+        const sz = BAKE.hFar*(0.16 + u*0.5);
+        ctx.globalAlpha = 0.26*(1-u)*(1-u);
+        ctx.drawImage(BAKE.blob, sx - sz + Math.sin(pl.ph+u*3)*sz*0.4, sy - u*BAKE.hFar*0.9 - sz*0.5, sz*2, sz);
+      }
+    }
+    ctx.restore();
+  },
+
+  /* ---- BAND LAYER: the distant highway ---- */
+  drawTraffic(hy){
+    if (!this.cars.length || !this.q(1)) return;
+    const y = hy - BAKE.hNear*0.72;
+    const px = -playerX*W*0.055;
+    ctx.save();
+    // the roadbed itself: one thin rule, so the lights are travelling on
+    // something rather than floating
+    ctx.globalAlpha = 0.20; ctx.fillStyle = mixHex(theme.mid, '#000000', 0.35);
+    ctx.fillRect(0, y, W, Math.max(1.2, BAKE.hNear*0.10));
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i=0;i<this.cars.length;i++){
+      const c = this.cars[i];
+      const cx = c.u*W*1.16 - W*0.08 + px*(0.6+c.k*0.5);
+      if (cx < -8 || cx > W+8) continue;
+      const w2 = Math.max(1.6, W*0.006), h2 = Math.max(1.1, BAKE.hNear*0.07);
+      ctx.globalAlpha = 0.75;
+      ctx.fillStyle = c.dir > 0 ? 'rgba(255,236,190,1)' : 'rgba(255,110,80,1)';
+      ctx.fillRect(cx, y - h2*0.4, w2, h2);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.restore();
+  },
+
+  /* ---- BAND LAYER: the L crossing the background of THE LOOP ---- */
+  drawTrain(hy){
+    const tr = this.train;
+    if (!tr.on) return;
+    const u = tr.t / TUNE.trainCross;
+    const bandH = BAKE.hMid;
+    const h2 = bandH*1.15;
+    const spr = litArt('scen_ltrain');
+    const w2 = spr ? h2*(spr.fw/spr.fh) : h2*1.6;
+    const x = W*1.10 - u*(W*1.20 + w2);
+    const y = hy - BAKE.hNear*0.55;
+    ctx.save();
+    ctx.globalAlpha = 0.95;
+    if (spr) blitSprite(spr, x, y, h2/spr.unitsHigh, t, true);   // travelling left
+    else {
+      ctx.fillStyle = '#2b3242'; ctx.fillRect(x-w2*0.5, y-h2*0.72, w2, h2*0.46);
+      ctx.fillStyle = '#151a24'; ctx.fillRect(x-w2*0.5, y-h2*0.26, w2, h2*0.26);
+      ctx.fillStyle = 'rgba(255,214,150,0.9)';
+      const n2 = 8, ww = w2/(n2*1.8);
+      for (let i=0;i<n2;i++) ctx.fillRect(x-w2*0.44+i*ww*1.8, y-h2*0.62, ww, h2*0.16);
+    }
+    ctx.restore();
+  },
+
+  /* ---- HORIZON LAYER: wind turbines whose blades actually turn ----
+     The shipped scen_turbine is a 3/4 render with a foreshortened rotor and is
+     used as a roadside PROP; these are the far-field ones, silhouetted, and
+     they are the ones you watch turning. Three blades = three quads. */
+  drawTurbines(hy){
+    if (!theme.turbines || !this.q(1)) return;
+    const base = hy - BAKE.hNear*0.75;
+    const col  = mixHex(theme.mid, '#000000', 0.25);
+    const px = -playerX*W*0.05;
+    ctx.save();
+    ctx.fillStyle = col; ctx.strokeStyle = col;
+    for (let i=0;i<5;i++){
+      const cx = ((i*0.23 + 0.06)*W + px + (dist*0.010)%W + W) % (W*1.2) - W*0.1;
+      const th = BAKE.hFar*(0.62 + (i%3)*0.14);
+      const r  = th*0.42;
+      const hubY = base - th;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = Math.max(1, th*0.035);
+      ctx.beginPath(); ctx.moveTo(cx, base); ctx.lineTo(cx, hubY); ctx.stroke();
+      const a0 = t*(1.5 + i*0.18) + i;
+      ctx.beginPath();
+      for (let b=0;b<3;b++){
+        const a = a0 + b*2.0944;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        // foreshortened: the rotor plane is edge-on to the road
+        ctx.moveTo(cx, hubY);
+        ctx.lineTo(cx + ca*r*0.62 - sa*r*0.09, hubY + sa*r*0.62 + ca*r*0.09);
+        ctx.lineTo(cx + ca*r,                  hubY + sa*r);
+        ctx.lineTo(cx + ca*r*0.62 + sa*r*0.09, hubY + sa*r*0.62 - ca*r*0.09);
+        ctx.closePath();
+      }
+      ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, hubY, Math.max(1.2, th*0.05), 0, 6.2832); ctx.fill();
+    }
+    ctx.restore();
+  },
+
+  /* ---- HORIZON LAYER: mountain mist / lake-effect haze ---- */
+  drawMist(hy, wrap){
+    if (!BAKE.mist || !this.q(1)) return;
+    const px = -playerX*W;
+    ctx.save();
+    ctx.globalAlpha = 0.95;
+    wrap(BAKE.mist[0], BAKE.mistW, BAKE.mistH, hy - BAKE.mistH*0.62,
+         px*0.070 + this.mistT*7);
+    if (this.q(3)){          // the second, faster-parallaxing layer is a luxury
+      ctx.globalAlpha = 0.85;
+      wrap(BAKE.mist[1], BAKE.mistW, BAKE.mistH, hy - BAKE.mistH*0.30,
+           px*0.110 - this.mistT*11);
+    }
+    ctx.restore();
+  },
+  drawHaze(hy){
+    if (!theme.haze || !this.q(2)) return;
+    const hh = (H-hy)*0.20;
+    ctx.save();
+    ctx.globalAlpha = 0.34 + 0.06*Math.sin(t*0.35);
+    ctx.fillStyle = lgrad('haze|'+themeIdx+'|'+(H|0), 0, hy-hh*0.5, 0, hy+hh,
+      ()=>[[0, hexA(theme.skyB, 0)],[0.42, hexA(theme.skyB, 0.85)],[1, hexA(theme.skyB, 0)]]);
+    ctx.fillRect(0, hy-hh*0.5, W, hh*1.5);
+    ctx.restore();
+  },
+
+  /* ---- GROUND LAYER: water shimmer, either side of the causeway ---- */
+  drawWater(hy){
+    if (!theme.water || !BAKE.waterH || !this.q(1)) return;
+    const wh = BAKE.waterH*FOV;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const warm = theme.sunLow || theme.moon;
+    ctx.fillStyle = warm ? 'rgba(255,214,160,1)' : 'rgba(190,228,255,1)';
+    const N2 = 14;
+    for (let i=0;i<N2;i++){
+      const f = (i+0.5)/N2;
+      const yy = hy + wh*f*f;                       // compress toward the far bank
+      const tt = (yy-hy)/Math.max(1,(H-hy)*FOV);
+      const half = (RW0 + (RW1-RW0)*tt)*FOV;
+      const ph2 = i*2.399;
+      const a = (0.030 + 0.050*Math.abs(Math.sin(t*(0.8+i*0.17) + ph2))) * (0.45 + 0.55*f);
+      ctx.globalAlpha = a;
+      const th = Math.max(0.8, wh*0.014);
+      const len = half*(0.9 + 0.9*Math.abs(Math.sin(ph2*1.7)));
+      const jit = Math.sin(t*0.6+ph2)*W*0.05;
+      ctx.fillRect(W*0.5 - half*1.35 - len + jit, yy, len, th);
+      ctx.fillRect(W*0.5 + half*1.35 + jit,       yy, len, th);
+    }
+    ctx.restore();
+  },
+
+  /* ---- GROUND LAYER: heat shimmer over the plateau ---- */
+  drawShimmer(hy){
+    if (!theme.shimmer || !this.q(2) || REDUCED) return;
+    ctx.save();
+    ctx.globalAlpha = 0.055;
+    ctx.fillStyle = theme.skyB;
+    for (let i=0;i<6;i++){
+      const yy = hy - (H-hy)*0.02 + i*(H-hy)*0.022;
+      const dx = Math.sin(t*2.1 + i*1.3)*W*0.012;
+      ctx.fillRect(dx, yy, W, Math.max(1.5, (H-hy)*0.012));
+    }
+    ctx.restore();
+  },
+
+  /* ---- GROUND LAYER: fireflies over the Indiana fields ---- */
+  drawFlies(hy){
+    if (!this.flies.length || !this.q(1) || REDUCED) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const glow = this.q(3);
+    for (let i=0;i<this.flies.length;i++){
+      const f = this.flies[i];
+      const x = f.x + Math.sin(t*f.sp + f.ph)*f.amp - playerX*W*0.05;
+      const y = f.y + Math.cos(t*f.sp*0.7 + f.ph)*f.amp*0.6;
+      const b = Math.max(0, Math.sin(t*f.blink*2.2 + f.ph));
+      if (b < 0.05) continue;
+      const a = b*b*0.85;
+      if (glow && b > 0.8 && (i & 1)){
+        ctx.globalAlpha = a*0.35;
+        ctx.drawImage(glowSprite('#ffe07a'), x-7, y-7, 14, 14);
+      }
+      ctx.globalAlpha = a;
+      ctx.fillStyle = 'rgba(255,236,150,1)';
+      ctx.fillRect(x-1, y-1, 2.2, 2.2);
+    }
+    ctx.restore();
+  }
+};
+
 function drawBackdrop(){
   const hy = HORIZON();
-  const M  = shake>0 ? shake+2 : 0;               // over-draw so shake never
-                                                  // exposes unpainted edges
+  ENV.reseed();          // idempotent: early-returns unless theme or size moved
+  // over-draw so neither the shake nor the camera lean can expose a raw edge
+  const M  = (shake>0 ? shake+2 : 0) + camMargin;
   bakeAll(theme); bakeRoad();
 
   // --- sky ---
   ctx.drawImage(BAKE.sky, -M, -M, W+M*2, hy+M);
 
   // --- clouds (blit the baked shape; no per-frame path building) ---
-  if (!theme.stars && theme.clouds && BAKE.clouds){
+  if (theme.clouds && BAKE.clouds){
     // clouds react to lane changes like the parallax bands do
     const cpx = -playerX*W*0.045;
+    /* Shed half the sky before shedding a frame — and on the two mountain
+       stages the mist bands are already carrying the air, so half the cloud
+       field is pure cost there at any quality level. */
+    const half = QUALITY.level <= 1 || !!theme.mist;
+    let ci = 0;
     for (const c of clouds){
+      if (half && (ci++ & 1)) continue;
       const w = c.s*2, h = w*0.70;
       let cx = c.x + cpx*c.d;
       if (cx - w > W) cx -= (W + w*2);
@@ -4172,39 +5237,85 @@ function drawBackdrop(){
     ctx.globalAlpha = 1;
   }
 
+  // --- birds cross the open sky, behind the ridgeline ---
+  ENV.drawBirds(hy);
+
   // --- parallax: lateral camera parallax from the player's lane + slow drift ---
   const L = QUALITY.parallaxLayers;
   const px = playerX;                       // -0.62 .. 0.62
-  function band(img, bw, h, depth, driftRate){
-    // snap the scroll offset to a whole DEVICE pixel: an unrounded offset makes
-    // every band blit take the resampling path instead of a straight copy,
-    // and three bands drawn 1.5 screens wide is a lot of frame to resample.
-    let off = ((-px*W*depth*0.10) - (dist*driftRate)) % bw;
+  /* Wrap-blit that only ever touches the [0,W] window. The bands are baked
+     1.5 screens wide and the hero plate is wider still; blitting the whole
+     tile three times was up to 4.5 viewport-widths of blending per layer, most
+     of it off-screen. Source rects are computed so the rasteriser is handed
+     exactly the visible slice, and the offset is snapped to a whole DEVICE
+     pixel so each slice stays a 1:1 copy rather than a resample. */
+  function wrapBand(img, bw, h, y, off){
     off = Math.round(off*DPR)/DPR;
-    const y = hy - h;
-    ctx.drawImage(img, off - bw, y, bw, h);
-    ctx.drawImage(img, off,      y, bw, h);
-    if (off + bw < W) ctx.drawImage(img, off+bw, y, bw, h);
+    const xa = -M, xb = W + M;
+    let x = off % bw; while (x > xa) x -= bw;
+    const sc = img.width / bw;               // bake is at DPR: sc === DPR
+    while (x < xb){
+      const a0 = Math.max(0, xa-x), a1 = Math.min(bw, xb - x);
+      if (a1 > a0) ctx.drawImage(img, a0*sc, 0, (a1-a0)*sc, img.height, x+a0, y, a1-a0, h);
+      x += bw;
+    }
   }
-  band(BAKE.far, BAKE.farW, BAKE.hFar, 1, 0.008);
+  function band(img, bw, h, depth, driftRate){
+    wrapBand(img, bw, h, hy - h, (-px*W*depth*0.10) - (dist*driftRate));
+  }
+
+  /* --- HERO BACKDROP: the Smokies, and the Chicago skyline. It REPLACES the
+     far band on the stages that carry one, so the silhouette layer never
+     fights the painting. --- */
+  if (BAKE.hero){
+    wrapBand(BAKE.hero, BAKE.heroW, BAKE.heroH, hy - BAKE.heroH,
+             (-px*W*0.055) - (dist*0.006));
+  } else {
+    band(BAKE.far, BAKE.farW, BAKE.hFar, 1, 0.008);
+  }
+  ENV.drawPlumes(hy);
   if (L >= 2) band(BAKE.mid,  BAKE.midW,  BAKE.hMid,  2.1, 0.030);
+  ENV.drawTurbines(hy);
+  ENV.drawTrain(hy);
+  ENV.drawTraffic(hy);
   if (L >= 3) band(BAKE.near, BAKE.nearW, BAKE.hNear, 3.6, 0.085);
+  ENV.drawMist(hy, wrapBand);
 
   // --- distance haze: blends the horizon into the sky ---
   const fogH = (H-hy)*TUNE.fogDepth;
+  /* The haze band used to sit at a flat 0.72 on every stage, which erased the
+     near band (a white Kentucky fence line, a corn row) on the clear ones. It
+     is now the STAGE's own atmosphere: thick in a Smoky Mountain hollow, thin
+     on a bright plateau. */
+  const fogA = theme.fog ? 0.80 : (theme.haze || theme.mist ? 0.66 : 0.52);
   ctx.fillStyle = lgrad('fog|'+themeIdx+'|'+(H|0), 0, hy-fogH*0.35, 0, hy+fogH,
-    ()=>[[0, hexA(theme.skyB, 0.0)],[0.32, hexA(theme.skyB, 0.72)],[1, hexA(theme.skyB, 0)]]);
+    ()=>[[0, hexA(theme.skyB, 0.0)],[0.32, hexA(theme.skyB, fogA)],[1, hexA(theme.skyB, 0)]]);
   ctx.fillRect(-M, hy-fogH*0.35, W+M*2, fogH*1.35);
 
   // --- road (static bake). The FOV push rides on THIS blit only: the road is
   //     the layer you actually feel, and it keeps the baked road edges lined up
   //     with the projected rumble strip above. ---
   if (FOV !== 1){
-    const dw = W*FOV, dh = (H-hy)*FOV;
-    ctx.drawImage(BAKE.road, (W-dw)*0.5, hy, dw, dh);
+    const gh2 = H-hy, dw = W*FOV, dh = gh2*FOV, dx0 = (W-dw)*0.5;
+    ctx.drawImage(BAKE.road, dx0, hy, dw, dh);
+    /* FOV < 1 is the speed pull-back, and it shrinks the baked road away from
+       the bottom and the sides of the frame. Stretch the bake's last row down
+       into the gutter (its bottom rows are flat bands, so this is invisible)
+       and paint the side gutters with the near ground colour. */
+    if (FOV < 1){
+      const y1 = hy + dh;
+      ctx.drawImage(BAKE.road, 0, (gh2-1.5)*DPR, W*DPR, 1.5*DPR, dx0, y1-0.5, dw, H-y1+1);
+      if (dx0 > 0.5){
+        ctx.fillStyle = theme.grB;
+        ctx.fillRect(0, hy, dx0+0.5, H-hy); ctx.fillRect(W-dx0-0.5, hy, dx0+0.5, H-hy);
+      }
+    }
   } else {
     ctx.drawImage(BAKE.road, 0, hy, W, H-hy);
   }
+  ENV.drawWater(hy);
+  ENV.drawHaze(hy);
+  ENV.drawShimmer(hy);
   if (M>0){ // paint the shake gutters with the near road/grass colour
     ctx.fillStyle = theme.grB;
     ctx.fillRect(-M, H-1, W+M*2, M+2);
@@ -4275,6 +5386,8 @@ function drawBackdrop(){
       ctx.lineTo(b.x+wb,b.y); ctx.lineTo(b.x-wb,b.y); ctx.closePath(); ctx.fill();
     }
   }
+  ENV.drawFlies(hy);
+
   // --- neon transverse sweep lines (glow is baked; these just scroll) ---
   if (theme.neon){
     const off = (dist*0.02)%1;
@@ -4339,7 +5452,8 @@ function drawEntities(){
 /* ---- speed feedback ---- */
 function drawSpeedStreaks(){
   if (!QUALITY.streaks || REDUCED) return;
-  const it = Math.min(1, (speed-2.6)/6);
+  // the streak field is part of the crescendo: a long combo widens it a little
+  const it = Math.min(1, (speed-2.6)/6 + Math.max(0, combo-3)*0.035);
   if (it <= 0) return;
   // radial motion blur: streaks stream OUT of the vanishing point and are only
   // drawn in the outer band, so the centre of the frame stays clean.
@@ -4457,8 +5571,11 @@ function drawWeatherAndFlash(){
   /* was two 30%-alpha coloured rectangles over the FULL frame height — sky and
      HUD included. Now: radial, an order of magnitude weaker, and clipped to
      the ground so it can never tint the sky or wash the HUD. */
-  if (combo >= 6 && !REDUCED){
-    const a = Math.min(0.11, (combo-5)*0.020);
+  /* STREAK CRESCENDO. This used to switch on at combo 6 at a fixed strength;
+     it now ramps continuously from combo 3 to the cap, so the run BUILDS. */
+  if (combo >= 3 && !REDUCED){
+    const ckk = Math.min(1, (combo-2)/(TUNE.comboMax-2));
+    const a = 0.020 + 0.095*ckk*ckk;
     const hy2 = HORIZON(), rr = Math.max(W,H)*0.55, cy2 = hy2 + (H-hy2)*0.62;
     ctx.save();
     ctx.beginPath(); ctx.rect(0, hy2, W, H-hy2); ctx.clip();
@@ -4475,34 +5592,63 @@ function drawWeatherAndFlash(){
 
 function drawBanner(){
   if (levelBanner <= 0) return;
-  const a = Math.min(1, levelBanner*1.5), wob = REDUCED?0:Math.sin(t*6)*0.02;
+  const a = Math.min(1, levelBanner*1.5), wob = REDUCED?0:Math.sin(t*6)*0.015;
   ctx.save(); ctx.globalAlpha=a; ctx.textAlign='center'; ctx.textBaseline='alphabetic';
   ctx.lineJoin='round'; ctx.miterLimit=2;   // miter spikes on the display face
-  /* "LEVEL 14 · LEGEND" at celebSize is wider than a 393px phone, so the
-     banner ran off both edges. Fit it to the frame instead of clipping it. */
+
+  /* Fit to the frame rather than clipping: "CUMBERLAND PLATEAU" at celebSize
+     is wider than a 375px phone. */
   const maxTxtW = W*0.86;
-  const bsz = Math.max(16, Math.min(celebSize(0.046), maxTxtW / Math.max(0.01, labelEmW(levelTxt))));
-  /* ...and on a 667px phone H*0.26 puts the plaque straight through the
-     right-hand HUD plate, which is drawn AFTER it. Clear the HUD first. */
+  const nSz  = Math.max(15, Math.min(celebSize(0.044), maxTxtW / Math.max(0.01, labelEmW(levelTxt))));
+  const preS = Math.max(9,  Math.min(nSz*0.30, maxTxtW / Math.max(0.01, labelEmW(levelPre)*1.5)));
+  const subS = Math.max(10, Math.min(nSz*0.34, maxTxtW / Math.max(0.01, labelEmW(levelSub))));
+  const dotR = Math.max(2, nSz*0.075), dotG = dotR*3.1;
+  const topPad = preS*1.85, botPad = subS*1.55 + dotR*7.0;   // the route marks must not clip
+
+  /* The HUD plates are drawn AFTER the banner, so the banner has to clear them
+     itself: left plate bottom = top+90*scale, right plate bottom = top+171*scale
+     (both measured in drawHUD's own scale). Verified at 375x667. */
   const hs = Math.min(1.25, Math.max(0.85, W/393));
-  const by = Math.max(H*0.26, SAFE.t + 12 + 171*hs + bsz*0.92 + 10);
+  const by = Math.max(H*0.25, SAFE.t + 12 + 171*hs + topPad + nSz*0.92 + 12);
   ctx.translate(W/2, by); ctx.rotate(wob);
-  /* #ffce4d on a golden sky measured 1.18:1 — the dark stroke was doing all
-     the work and it disappears at speed on a cracked screen. A soft plaque
-     underneath takes it to ~5:1 without changing the type. */
-  font(800, bsz, 1);
-  const subSz = Math.max(12, Math.min(bsz*0.40, maxTxtW / Math.max(0.01, labelEmW(levelSub))));
-  const bw = Math.max(bsz*labelEmW(levelTxt), subSz*labelEmW(levelSub));
-  roundRect(-bw/2 - bsz*0.42, -bsz*0.92, bw + bsz*0.84, bsz*2.10, bsz*0.34);
-  ctx.fillStyle = 'rgba(5,10,22,0.74)'; ctx.fill();
-  ctx.strokeStyle = 'rgba(255,206,77,0.28)'; ctx.lineWidth = 1.5; ctx.stroke();
-  font(800, bsz, 1);
-  ctx.lineWidth=Math.max(6, bsz*0.20); ctx.strokeStyle='rgba(0,0,0,.55)'; ctx.strokeText(levelTxt,0,0);
+
+  const bw = Math.max(nSz*labelEmW(levelTxt), subS*labelEmW(levelSub),
+                      preS*labelEmW(levelPre)*1.5, THEMES.length*dotG);
+  roundRect(-bw/2 - nSz*0.42, -nSz*0.92 - topPad, bw + nSz*0.84,
+            nSz*0.92 + topPad + botPad + nSz*0.20, nSz*0.30);
+  ctx.fillStyle = 'rgba(5,10,22,0.80)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,206,77,0.30)'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // --- "NOW ENTERING", small and letterspaced: the crossing-a-line cue ---
+  font(800, preS, 0);
+  setLS(Math.max(1.5, preS*0.22).toFixed(1)+'px');
+  ctx.lineWidth = Math.max(2, preS*0.22); ctx.strokeStyle='rgba(0,0,0,.55)';
+  ctx.strokeText(levelPre, 0, -nSz*0.92 - preS*0.55);
+  ctx.fillStyle='rgba(196,215,244,0.95)'; ctx.fillText(levelPre, 0, -nSz*0.92 - preS*0.55);
+  setLS('0px');
+
+  // --- the PLACE ---
+  font(800, nSz, 1);
+  ctx.lineWidth=Math.max(6, nSz*0.20); ctx.strokeStyle='rgba(0,0,0,.55)'; ctx.strokeText(levelTxt,0,0);
   ctx.fillStyle='#ffce4d'; ctx.fillText(levelTxt,0,0);
-  font(700, subSz, 1);
-  const sy = bsz*0.86;
-  ctx.lineWidth=Math.max(4, bsz*0.11); ctx.strokeText(levelSub,0,sy);
+
+  // --- region · level · rank ---
+  font(700, subS, 1);
+  const sy = nSz*0.42 + subS*0.86;
+  ctx.lineWidth=Math.max(3, subS*0.26); ctx.strokeStyle='rgba(0,0,0,.55)'; ctx.strokeText(levelSub,0,sy);
   ctx.fillStyle='#fff'; ctx.fillText(levelSub,0,sy);
+
+  /* --- the route: 12 marks, one per stage, filled up to where you are. This
+     is the "further up the map" read, and it costs two paths. --- */
+  const dy = sy + subS*0.55 + dotR*2.0;
+  const here = themeIdx;
+  const x0 = -(THEMES.length-1)*dotG*0.5;
+  ctx.beginPath();
+  for (let i=0;i<THEMES.length;i++){ ctx.moveTo(x0+i*dotG+dotR, dy); ctx.arc(x0+i*dotG, dy, dotR, 0, 6.2832); }
+  ctx.fillStyle='rgba(255,255,255,0.20)'; ctx.fill();
+  ctx.beginPath();
+  for (let i=0;i<=here;i++){ ctx.moveTo(x0+i*dotG+dotR, dy); ctx.arc(x0+i*dotG, dy, dotR*(i===here?1.45:1), 0, 6.2832); }
+  ctx.fillStyle='#ffce4d'; ctx.fill();
   ctx.restore();
 }
 
@@ -4756,9 +5902,21 @@ function render(){
 
   ctx.save();
   if (shake>0 && !REDUCED) ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+  /* Camera lean: a small lateral offset plus a capped roll about a pivot BELOW
+     the frame, so the horizon tips rather than the whole image spinning about
+     its middle. Both are already clamped in update(); the roll is applied here
+     because it must wrap the world and NOT the HUD. */
+  const camOff = camX + camKick*TUNE.camKickX*W;
+  camMargin = (camOff || camRollV) ? Math.ceil(Math.abs(camOff) + Math.abs(camRollV)*H) + 2 : 0;
+  if (camOff || camRollV){
+    // pivot near the player, so the horizon tips and his own footing does not
+    ctx.translate(W*0.5 + camOff, H*0.72);
+    ctx.rotate(camRollV);
+    ctx.translate(-W*0.5, -H*0.72);
+  }
   // FOV push is baked into the projection (see §3) — no ctx.scale() here, so
   // every backdrop blit stays a 1:1, integer-aligned fast path.
-  FOV = 1 + fovPush;
+  FOV = 1 + fovPush - camPull;
   drawBackdrop();
   drawEntities();
   if (state===PLAY) drawSpeedStreaks();
@@ -5230,17 +6388,28 @@ function loop(now){
               : deathT > T-R      ? m + (1-m)*Math.min(1,(deathT-(T-R))/R)
               :                     m;
     dt *= timeScale;
+  } else if (nearSlow > 0){
+    /* NEAR MISS: a sliver of slow-motion on the wall clock, easing straight
+       back out. Short enough (130 ms) that it never costs a reaction window. */
+    nearSlow -= dt;
+    const u = Math.max(0, nearSlow / TUNE.nearSlowT);
+    timeScale = 1 - (1 - TUNE.nearSlowMo)*u;
+    dt *= timeScale;
   } else timeScale = 1;
 
   const t0 = performance.now();
   if (coach > 0){
-    // hold the world: no spawning, no speed, no collisions — only the idle
-    // animation clock advances so the scene does not look like a still image
     coach = Math.max(0, coach - dt);
-    t += dt;
-    render();
-    QUALITY.sample(performance.now() - t0, frameMs);
-    return;
+    if (coachHeld){
+      // hold the world: no spawning, no speed, no collisions — only the idle
+      // animation clock advances so the scene does not look like a still image
+      t += dt;
+      render();
+      QUALITY.sample(performance.now() - t0, frameMs);
+      return;
+    }
+    // coachHeld is false => the player has already pressed something. The world
+    // runs from this frame on; the callouts merely fade out over live play.
   }
   if (hitStop > 0){ hitStop -= dt; }      // 2-3 frame freeze on impact
   else update(dt);
@@ -5251,7 +6420,10 @@ function loop(now){
 
 /* ---------------- attract scene for the frozen menu backdrop ---------------- */
 function buildAttractScene(){
-  themeIdx = 1; theme = THEMES[themeIdx];            // GOLDEN HOUR: warm, high-contrast
+  // TENNESSEE SUNRISE: stage 2 of the route — a gold horizon under a deep blue
+  // zenith, which is where the run actually begins and reads well behind the
+  // navy menu panel.
+  themeIdx = 1; theme = THEMES[themeIdx];
   t = 1.35; dist = 640; speed = 7; combo = 3; shield = 1; level = 4;
   jumpY = 0; jumpV = 0; playerX = 0; lane = 1; shake = 0; flash = 0; fovPush = 0.02;
   obstacles.length = 0; orbs.length = 0; scen.length = 0;
@@ -5260,7 +6432,7 @@ function buildAttractScene(){
   obstacles.push({nx:LANEX[1],lane:1,z:0.24,pz:0.24,w:OBST_W,hit:false,low:true, id:'falloff',ph:1.1});
   for (let i=0;i<4;i++) orbs.push({nx:LANEX[1],lane:1,z:0.34-i*0.075,pz:0,got:false,ph:i*1.3,kind:'xm',high:false,spark:0});
   orbs.push({nx:LANEX[0],lane:0,z:0.30,pz:0,got:false,ph:0.4,kind:'tsheet',high:false,spark:0});
-  scen.push({nx:-1.24,z:0.55,side:-1,type:'flag',ph:0.2});
+  scen.push({nx:-1.24,z:0.55,side:-1,type:'pine',ph:0.2});
   scen.push({nx: 1.30,z:0.36,side: 1,type:'sign',ph:1.4});
   scen.push({nx:-1.36,z:0.22,side:-1,type:'tree',ph:2.4});
 }
@@ -5275,6 +6447,7 @@ if (/[?&]dev=1/.test(location.search)){
     goto(n, opts){                       // jump straight to level n
       if (state !== PLAY) startGame();
       level = Math.max(1, n) - 1; levelBonus = Math.min(TUNE.levelBonusMax, (n-1)*TUNE.levelBonusStep);
+      levelDist = 0;                     // otherwise successive gotos accumulate a natural level-up
       levelUp(); levelBanner = 0;
       const o = opts || {};
       if (o.combo)   { combo = o.combo; comboTimer = TUNE.comboWindow; bestCombo = combo; }
@@ -5286,9 +6459,17 @@ if (/[?&]dev=1/.test(location.search)){
                         for (const x of obstacles) x.z += 0.10; for (const x of orbs) x.z += 0.10;
                         for (const x of scen) x.z += 0.12; } }
     },
+    bench(n){ n = n||120; render(); const t0 = performance.now();
+              for (let i=0;i<n;i++) render(); return (performance.now()-t0)/n; },
+    qlock(l){ QUALITY.level = l; QUALITY.max = l; QUALITY.apply();
+              QUALITY.sample = function(){}; },
     god(v){ devGod = v !== false; },
+    banner(){ levelBanner = 1.8; },          // hold the arrival plaque for a screenshot
+    lit(k){ const l = litArt(k); return l && { fw:l.fw, frames:l.frames, fps:l.fps, sx:l._sx }; },
     kill(){ if (state === PLAY) gameOver(); },
     raw(){ return { obstacles, orbs, lane, playerX }; },
+    tune: TUNE,
+    addObs, LANEX,
     dbg(){ let parts = 0; for (const q of particles.a) if (q.active) parts++;
            return { state, lane, playerX, laneT, jumpY, shake, flash, bumpFlash, nearGlow,
                     parts, dying, dpr: DPR, quality: QUALITY.level,
